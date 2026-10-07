@@ -4,11 +4,10 @@ const { createLLM } = require('../../common/ai/factory');
 const sessionRepository = require('../../common/repositories/session');
 const summaryRepository = require('./repositories');
 const modelStateService = require('../../common/services/modelStateService');
-const { streamAnswer } = require('./fastAnswer');
+const { LiveQA } = require('./liveQA');
 
-// How long the live transcript must stop changing before we start answering
-// a question speculatively (before the speaker has fully finished).
-const SPECULATIVE_PAUSE_MS = 350;
+// Refresh the Meeting summary after this many new transcript lines.
+const SUMMARY_EVERY_N_TURNS = 8;
 
 class SummaryService {
     constructor() {
@@ -16,11 +15,7 @@ class SummaryService {
         this.analysisHistory = [];
         this.conversationHistory = [];
         this.currentSessionId = null;
-        this.liveRequestId = 0;
-        this.lastLiveAnswer = null;
-        this.activeQuestion = null;
-        this.liveAbort = null;
-        this.partialTimer = null;
+        this.liveQA = new LiveQA((channel, data) => this.sendToRenderer(channel, data));
 
         // Callbacks
         this.onAnalysisComplete = null;
@@ -51,158 +46,17 @@ class SummaryService {
         console.log(`💬 Added conversation text: ${conversationText}`);
         console.log(`📈 Total conversation history: ${this.conversationHistory.length} texts`);
 
-        if (this.partialTimer) clearTimeout(this.partialTimer);
+        // Answers tab: detect the main question and answer it right away.
+        this.liveQA.onFinalTurn(speaker, text, this.conversationHistory);
 
-        // Live answers: when a question is heard (call audio or mic), answer it
-        // immediately. If we already started answering this question from the
-        // partial transcript, keep that answer instead of starting over.
-        const isQuestion = this.looksLikeQuestion(text);
-        const isSubstantialFromThem =
-            speaker.toLowerCase() === 'them' && text.trim().split(/\s+/).length >= 6;
-        if (isQuestion || isSubstantialFromThem) {
-            const q = text.trim();
-            if (!this.isSameQuestion(this.activeQuestion, q)) {
-                this.answerLive(q);
-            } else if (this.lastLiveAnswer) {
-                // Same question: keep the answer, just show the final wording.
-                this.activeQuestion = q;
-                this.sendToRenderer('summary-update', this.buildLiveData(q, this.lastLiveAnswer.lines));
-            }
-        }
-
-        // Trigger analysis if needed
+        // Meeting tab: periodic overall summary.
         this.triggerAnalysisIfNeeded();
     }
 
-    /**
-     * Called with the live (partial) transcript while someone is still talking.
-     * Once the text looks like a question and stops changing briefly, start
-     * answering speculatively so the answer is ready the moment they finish.
-     */
+    /** Live (partial) transcript while someone is still talking. */
     onPartialTranscript(speaker, text) {
-        const q = (text || '').trim();
-        if (this.partialTimer) clearTimeout(this.partialTimer);
-        if (!this.looksLikeQuestion(q) || q.split(/\s+/).length < 4) return;
-
-        this.partialTimer = setTimeout(() => {
-            if (!this.isSameQuestion(this.activeQuestion, q)) {
-                console.log(`⚡ Speculative answer from partial: ${q}`);
-                this.answerLive(q);
-            }
-        }, SPECULATIVE_PAUSE_MS);
-    }
-
-    normalizeQuestion(t) {
-        return (t || '').toLowerCase().replace(/[^a-z0-9 ]/g, '').replace(/\s+/g, ' ').trim();
-    }
-
-    /**
-     * True when `finalQ` is just `startedQ` with a few trailing words, so the
-     * answer already in progress is still the right one.
-     */
-    isSameQuestion(startedQ, finalQ) {
-        const a = this.normalizeQuestion(startedQ);
-        const b = this.normalizeQuestion(finalQ);
-        if (!a || !b) return false;
-        if (a === b) return true;
-        return b.startsWith(a) && b.length - a.length <= 12;
-    }
-
-    /**
-     * Speech-to-text often drops the "?", so also match question/prompt words.
-     */
-    looksLikeQuestion(text) {
-        const t = (text || '').trim();
-        if (t.split(/\s+/).length < 3) return false;
-        if (t.includes('?')) return true;
-        return /\b(what|why|how|when|where|who|which|explain|describe|define|tell (me|us)|walk (me|us) through|compare|contrast|calculate|give (me|us)|name|can you|could you|would you|do you|is it|are there|what's)\b/i.test(t);
-    }
-
-    toAnswerLines(text) {
-        return (text || '')
-            .split('\n')
-            .map(l => l.replace(/^\s*[-*•]\s*/, '').replace(/\*\*/g, '').trim())
-            .filter(Boolean);
-    }
-
-    async answerLive(question) {
-        const requestId = ++this.liveRequestId;
-        const startedAt = Date.now();
-        this.activeQuestion = question;
-
-        // Cancel any answer still streaming for an older question.
-        if (this.liveAbort) this.liveAbort.abort();
-        const abort = new AbortController();
-        this.liveAbort = abort;
-
-        this.sendToRenderer('summary-update', this.buildLiveData(question, ['…']));
-
-        try {
-            const modelInfo = await modelStateService.getCurrentModelInfo('llm');
-            if (!modelInfo || !modelInfo.apiKey) throw new Error('AI model or API key is not configured.');
-
-            const recent = this.formatConversationForPrompt(this.conversationHistory, 8);
-            const system =
-                'You are a real-time assistant on a live call. "them" is the other person; "me" is the user. ' +
-                'If the latest line is a question, answer it so the user can say it out loud right away. ' +
-                'If it is a statement, give the best thing for the user to say or know in response. ' +
-                'Line 1: the direct answer in one short sentence. Then 2-3 bullets ("- ") with the key facts, ' +
-                'numbers, examples or reasoning. Economics questions are common: use correct terms and brief ' +
-                'intuition. The question may be cut off mid-sentence; answer the most likely full question. ' +
-                'No preamble, no headings, under 80 words.';
-            const user = `Recent conversation:\n${recent}\n\nLatest line to respond to now: ${question}`;
-
-            let firstTokenAt = 0;
-            let lastPush = 0;
-            const full = await streamAnswer({
-                provider: modelInfo.provider,
-                apiKey: modelInfo.apiKey,
-                model: modelInfo.model,
-                system,
-                user,
-                temperature: 0.3,
-                maxTokens: 260,
-                signal: abort.signal,
-                onDelta: textSoFar => {
-                    if (requestId !== this.liveRequestId) return;
-                    const now = Date.now();
-                    if (!firstTokenAt) {
-                        firstTokenAt = now;
-                        console.log(`⚡ First answer words in ${now - startedAt}ms`);
-                    }
-                    // Push to the UI at most every ~60ms while streaming.
-                    if (now - lastPush >= 60) {
-                        lastPush = now;
-                        const lines = this.toAnswerLines(textSoFar);
-                        if (lines.length) this.sendToRenderer('summary-update', this.buildLiveData(this.activeQuestion, lines));
-                    }
-                },
-            });
-
-            if (requestId !== this.liveRequestId) return; // superseded by a newer question
-            console.log(`⚡ Full answer in ${Date.now() - startedAt}ms`);
-            const lines = this.toAnswerLines(full);
-            this.sendToRenderer(
-                'summary-update',
-                this.buildLiveData(this.activeQuestion, lines.length ? lines : ['(No answer returned)'])
-            );
-        } catch (error) {
-            if (error.name === 'AbortError' || requestId !== this.liveRequestId) return;
-            console.error('❌ Live answer failed:', error.message);
-            this.sendToRenderer('summary-update', this.buildLiveData(question, [`Couldn't answer: ${error.message}`]));
-        }
-    }
-
-    buildLiveData(question, answerLines) {
-        const base = this.previousAnalysisResult || {
-            summary: [],
-            topic: { header: '', bullets: [] },
-            actions: [],
-            followUps: [],
-        };
-        const data = { ...base, liveAnswer: { question, lines: answerLines.slice(0, 5) } };
-        this.lastLiveAnswer = data.liveAnswer;
-        return data;
+        this.liveQA.setHistory(this.conversationHistory);
+        this.liveQA.onPartial(speaker, text);
     }
 
     getConversationHistory() {
@@ -210,10 +64,7 @@ class SummaryService {
     }
 
     resetConversationHistory() {
-        this.lastLiveAnswer = null;
-        this.activeQuestion = null;
-        if (this.liveAbort) this.liveAbort.abort();
-        if (this.partialTimer) clearTimeout(this.partialTimer);
+        this.liveQA.reset();
         this.conversationHistory = [];
         this.previousAnalysisResult = null;
         this.analysisHistory = [];
@@ -467,13 +318,11 @@ Keep all points concise and build upon previous analysis if provided.`,
      * Triggers analysis when conversation history reaches 5 texts.
      */
     async triggerAnalysisIfNeeded() {
-        if (this.conversationHistory.length >= 5 && this.conversationHistory.length % 5 === 0) {
+        if (this.conversationHistory.length >= SUMMARY_EVERY_N_TURNS && this.conversationHistory.length % SUMMARY_EVERY_N_TURNS === 0) {
             console.log(`Triggering analysis - ${this.conversationHistory.length} conversation texts accumulated`);
 
             const data = await this.makeOutlineAndRequests(this.conversationHistory);
             if (data) {
-                // Keep the latest live answer pinned on top when the summary refreshes.
-                if (this.lastLiveAnswer) data.liveAnswer = this.lastLiveAnswer;
                 console.log('Sending structured data to renderer');
                 this.sendToRenderer('summary-update', data);
                 

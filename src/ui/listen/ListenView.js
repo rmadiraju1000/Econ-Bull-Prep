@@ -1,6 +1,7 @@
 import { html, css, LitElement } from '../assets/lit-core-2.7.4.min.js';
 import './stt/SttView.js';
 import './summary/SummaryView.js';
+import './answers/AnswersView.js';
 
 export class ListenView extends LitElement {
     static styles = css`
@@ -289,6 +290,44 @@ export class ListenView extends LitElement {
             color: rgba(255, 255, 255, 0.7);
         }
         
+        .tabs {
+            display: flex;
+            gap: 4px;
+            align-items: center;
+        }
+
+        .tab-button {
+            background: transparent;
+            color: rgba(255, 255, 255, 0.65);
+            border: none;
+            outline: none;
+            padding: 4px 10px;
+            border-radius: 6px;
+            font-size: 13px;
+            font-weight: 500;
+            font-family: 'Helvetica Neue', sans-serif;
+            cursor: pointer;
+            height: 26px;
+            white-space: nowrap;
+            transition: background-color 0.15s ease, color 0.15s ease;
+        }
+
+        .tab-button:hover {
+            background: rgba(255, 255, 255, 0.1);
+            color: #ffffff;
+        }
+
+        .tab-button.active {
+            background: rgba(255, 255, 255, 0.18);
+            color: #ffffff;
+        }
+
+        .bar-right {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
         /* ────────────────[ GLASS BYPASS ]─────────────── */
         :host-context(body.has-glass) .assistant-container,
         :host-context(body.has-glass) .top-bar,
@@ -433,7 +472,7 @@ export class ListenView extends LitElement {
         super();
         this.isSessionActive = false;
         this.hasCompletedRecording = false;
-        this.viewMode = 'insights';
+        this.viewMode = 'answers'; // 'answers' | 'meeting' | 'transcript'
         this.isHovering = false;
         this.isAnimating = false;
         this.elapsedTime = '00:00';
@@ -465,8 +504,10 @@ export class ListenView extends LitElement {
                     this.updateComplete.then(() => {
                         const sttView = this.shadowRoot.querySelector('stt-view');
                         const summaryView = this.shadowRoot.querySelector('summary-view');
+                        const answersView = this.shadowRoot.querySelector('answers-view');
                         if (sttView) sttView.resetTranscript();
                         if (summaryView) summaryView.resetAnalysis();
+                        if (answersView) answersView.resetAnswers();
                     });
                     this.requestUpdate();
                 }
@@ -477,12 +518,8 @@ export class ListenView extends LitElement {
                 }
             });
 
-            // When a live answer arrives, jump to the Insights tab and grow the
-            // window to fit it (otherwise the answer can be hidden or clipped).
-            window.api.summaryView.onSummaryUpdate((event, data) => {
-                if (data?.liveAnswer && this.viewMode !== 'insights') {
-                    this.viewMode = 'insights';
-                }
+            // Meeting summary changed: resize so it isn't clipped.
+            window.api.summaryView.onSummaryUpdate(() => {
                 this.updateComplete.then(() => setTimeout(() => this.adjustWindowHeight(), 30));
             });
         }
@@ -527,9 +564,8 @@ export class ListenView extends LitElement {
         this.updateComplete
             .then(() => {
                 const topBar = this.shadowRoot.querySelector('.top-bar');
-                const activeContent = this.viewMode === 'transcript'
-                    ? this.shadowRoot.querySelector('stt-view')
-                    : this.shadowRoot.querySelector('summary-view');
+                const selector = { answers: 'answers-view', meeting: 'summary-view', transcript: 'stt-view' }[this.viewMode];
+                const activeContent = this.shadowRoot.querySelector(selector || 'answers-view');
 
                 if (!topBar || !activeContent) return;
 
@@ -552,9 +588,18 @@ export class ListenView extends LitElement {
             });
     }
 
-    toggleViewMode() {
-        this.viewMode = this.viewMode === 'insights' ? 'transcript' : 'insights';
+    setViewMode(mode) {
+        if (this.viewMode === mode) return;
+        this.viewMode = mode;
         this.requestUpdate();
+    }
+
+    handleQaUpdated(event) {
+        // A new question was detected: bring the Answers tab to the front.
+        if (event.detail?.newCard && this.viewMode !== 'answers') {
+            this.viewMode = 'answers';
+        }
+        this.updateComplete.then(() => setTimeout(() => this.adjustWindowHeight(), 30));
     }
 
     handleCopyHover(isHovering) {
@@ -572,7 +617,10 @@ export class ListenView extends LitElement {
 
         let textToCopy = '';
 
-        if (this.viewMode === 'transcript') {
+        if (this.viewMode === 'answers') {
+            const answersView = this.shadowRoot.querySelector('answers-view');
+            textToCopy = answersView ? answersView.getAnswersText() : '';
+        } else if (this.viewMode === 'transcript') {
             const sttView = this.shadowRoot.querySelector('stt-view');
             textToCopy = sttView ? sttView.getTranscriptText() : '';
         } else {
@@ -633,43 +681,24 @@ export class ListenView extends LitElement {
     }
 
     render() {
-        const displayText = this.isHovering
-            ? this.viewMode === 'transcript'
-                ? 'Copy Transcript'
-                : 'Copy Glass Analysis'
-            : this.viewMode === 'insights'
-            ? `Live insights`
-            : `Glass is Listening ${this.elapsedTime}`;
+        const tab = (mode, label) => html`
+            <button class="tab-button ${this.viewMode === mode ? 'active' : ''}" @click=${() => this.setViewMode(mode)}>
+                ${label}
+            </button>
+        `;
 
         return html`
             <div class="assistant-container">
                 <div class="top-bar">
-                    <div class="bar-left-text">
-                        <span class="bar-left-text-content ${this.isAnimating ? 'slide-in' : ''}">${displayText}</span>
+                    <div class="tabs">
+                        ${tab('answers', 'Answers')} ${tab('meeting', 'Meeting')} ${tab('transcript', 'Transcript')}
                     </div>
-                    <div class="bar-controls">
-                        <button class="toggle-button" @click=${this.toggleViewMode}>
-                            ${this.viewMode === 'insights'
-                                ? html`
-                                      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                                          <path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7z" />
-                                          <circle cx="12" cy="12" r="3" />
-                                      </svg>
-                                      <span>Show Transcript</span>
-                                  `
-                                : html`
-                                      <svg width="8" height="8" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                                          <path d="M9 11l3 3L22 4" />
-                                          <path d="M22 12v7a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h11" />
-                                      </svg>
-                                      <span>Show Insights</span>
-                                  `}
-                        </button>
+                    <div class="bar-right">
+                        ${this.isSessionActive ? html`<span class="timer">${this.elapsedTime}</span>` : ''}
                         <button
                             class="copy-button ${this.copyState === 'copied' ? 'copied' : ''}"
                             @click=${this.handleCopy}
-                            @mouseenter=${() => this.handleCopyHover(true)}
-                            @mouseleave=${() => this.handleCopyHover(false)}
+                            title="Copy this tab"
                         >
                             <svg class="copy-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                                 <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
@@ -682,13 +711,19 @@ export class ListenView extends LitElement {
                     </div>
                 </div>
 
+                <answers-view
+                    style=${this.viewMode === 'answers' ? '' : 'display:none'}
+                    .isVisible=${this.viewMode === 'answers'}
+                    @qa-updated=${this.handleQaUpdated}
+                ></answers-view>
+
                 <stt-view 
                     .isVisible=${this.viewMode === 'transcript'}
                     @stt-messages-updated=${this.handleSttMessagesUpdated}
                 ></stt-view>
 
                 <summary-view 
-                    .isVisible=${this.viewMode === 'insights'}
+                    .isVisible=${this.viewMode === 'meeting'}
                     .hasCompletedRecording=${this.hasCompletedRecording}
                 ></summary-view>
             </div>

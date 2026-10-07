@@ -93,10 +93,13 @@ async function streamOpenAIStyle({ provider, apiKey, model, system, user, temper
         usePortkey: provider === 'openai-glass',
         portkeyVirtualKey: provider === 'openai-glass' ? apiKey : undefined,
     });
-    const response = await llm.streamChat([
-        { role: 'system', content: system },
-        { role: 'user', content: user },
-    ]);
+    const response = await llm.streamChat(
+        [
+            { role: 'system', content: system },
+            { role: 'user', content: user },
+        ],
+        signal
+    );
     let full = '';
     for await (const data of readSSE(response, signal)) {
         if (!data || data === '[DONE]') continue;

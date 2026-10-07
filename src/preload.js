@@ -177,7 +177,11 @@ contextBridge.exposeInMainWorld('api', {
     
     // Listeners
     onSessionStateChanged: (callback) => ipcRenderer.on('session-state-changed', callback),
-    removeOnSessionStateChanged: (callback) => ipcRenderer.removeListener('session-state-changed', callback)
+    removeOnSessionStateChanged: (callback) => ipcRenderer.removeListener('session-state-changed', callback),
+
+    // Live question answering (Answers tab)
+    onQaUpdate: (callback) => ipcRenderer.on('qa-update', callback),
+    removeOnQaUpdate: (callback) => ipcRenderer.removeListener('qa-update', callback)
   },
 
   // src/ui/listen/stt/SttView.js

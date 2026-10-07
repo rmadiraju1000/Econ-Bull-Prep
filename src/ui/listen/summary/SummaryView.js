@@ -104,8 +104,8 @@ export class SummaryView extends LitElement {
         }
 
         insights-title {
-            color: rgba(255, 255, 255, 0.8);
-            font-size: 15px;
+            color: rgba(255, 255, 255, 0.85);
+            font-size: 16px;
             font-weight: 500;
             font-family: 'Helvetica Neue', sans-serif;
             margin: 12px 0 8px 0;
@@ -150,8 +150,8 @@ export class SummaryView extends LitElement {
 
         .request-item {
             color: #ffffff;
-            font-size: 12px;
-            line-height: 1.2;
+            font-size: 14px;
+            line-height: 1.35;
             margin: 4px 0;
             padding: 6px 8px;
             border-radius: 4px;
@@ -173,8 +173,8 @@ export class SummaryView extends LitElement {
         /* 마크다운 렌더링된 콘텐츠 스타일 */
         .markdown-content {
             color: #ffffff;
-            font-size: 11px;
-            line-height: 1.4;
+            font-size: 14px;
+            line-height: 1.45;
             margin: 4px 0;
             padding: 6px 8px;
             border-radius: 4px;
@@ -227,8 +227,8 @@ export class SummaryView extends LitElement {
             align-items: center;
             justify-content: center;
             height: 100px;
-            color: rgba(255, 255, 255, 0.6);
-            font-size: 12px;
+            color: rgba(255, 255, 255, 0.65);
+            font-size: 13px;
             font-style: italic;
         }
     `;
@@ -460,33 +460,13 @@ export class SummaryView extends LitElement {
             actions: [],
         };
 
-        const live = data.liveAnswer;
-        const hasAnyContent =
-            !!live || data.summary.length > 0 || data.topic.bullets.length > 0 || data.actions.length > 0;
+        const hasAnyContent = data.summary.length > 0 || data.topic.bullets.length > 0 || data.actions.length > 0;
 
         return html`
             <div class="insights-container">
                 ${!hasAnyContent
-                    ? html`<div class="empty-state">Listening… answers appear here when a question is asked.</div>`
+                    ? html`<div class="empty-state">The meeting summary updates as the conversation goes.</div>`
                     : html`
-                        ${live
-                            ? html`
-                                  <insights-title>💡 ${live.question}</insights-title>
-                                  ${live.lines.map(
-                                      (line, index) => html`
-                                          <div
-                                              class="markdown-content"
-                                              data-markdown-id="live-${index}"
-                                              data-original-text="${line}"
-                                              style="font-weight: ${index === 0 ? '600' : '400'};"
-                                              @click=${() => this.handleMarkdownClick(line)}
-                                          >
-                                              ${line}
-                                          </div>
-                                      `
-                                  )}
-                              `
-                            : ''}
                         <insights-title>Current Summary</insights-title>
                         ${data.summary.length > 0
                             ? data.summary

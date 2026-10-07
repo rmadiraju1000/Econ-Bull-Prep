@@ -46,7 +46,7 @@ export class SttView extends LitElement {
             word-wrap: break-word;
             word-break: break-word;
             line-height: 1.5;
-            font-size: 13px;
+            font-size: 15px;
             margin-bottom: 4px;
             box-sizing: border-box;
         }

@@ -58,6 +58,17 @@ const PROVIDERS = {
       ],
       sttModels: [],
   },
+  'groq': {
+      name: 'Groq (fastest)',
+      handler: () => require("./providers/groq"),
+      llmModels: [
+          { id: 'llama-3.3-70b-versatile', name: 'Llama 3.3 70B (fast + smart)' },
+          { id: 'openai/gpt-oss-20b', name: 'GPT-OSS 20B (fastest)' },
+          { id: 'openai/gpt-oss-120b', name: 'GPT-OSS 120B (smartest)' },
+          { id: 'llama-3.1-8b-instant', name: 'Llama 3.1 8B (instant)' },
+      ],
+      sttModels: [],
+  },
   'deepgram': {
     name: 'Deepgram',
     handler: () => require("./providers/deepgram"),
@@ -157,6 +168,7 @@ function getProviderClass(providerId) {
         'openai': 'OpenAIProvider',
         'anthropic': 'AnthropicProvider',
         'gemini': 'GeminiProvider',
+        'groq': 'GroqProvider',
         'deepgram': 'DeepgramProvider',
         'ollama': 'OllamaProvider',
         'whisper': 'WhisperProvider'
