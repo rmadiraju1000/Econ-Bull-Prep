@@ -49,8 +49,9 @@ class SttService {
         this.modelInfo = null; 
     }
 
-    setCallbacks({ onTranscriptionComplete, onStatusUpdate }) {
+    setCallbacks({ onTranscriptionComplete, onStatusUpdate, onPartialTranscript }) {
         this.onTranscriptionComplete = onTranscriptionComplete;
+        this.onPartialTranscript = onPartialTranscript;
         this.onStatusUpdate = onStatusUpdate;
     }
 
@@ -186,9 +187,11 @@ class SttService {
 
         if (final || interim) {
             // Still talking: push the live text and restart the end-of-sentence timer.
+            const liveText = join(this[bufferKey], this[interimKey]).trim();
+            this.onPartialTranscript?.(speaker, liveText);
             this.sendToRenderer('stt-update', {
                 speaker,
-                text: join(this[bufferKey], this[interimKey]).trim(),
+                text: liveText,
                 isPartial: true,
                 isFinal: false,
                 timestamp: Date.now(),

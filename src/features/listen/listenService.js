@@ -25,6 +25,9 @@ class ListenService {
             },
             onStatusUpdate: (status) => {
                 this.sendToRenderer('update-status', status);
+            },
+            onPartialTranscript: (speaker, text) => {
+                this.summaryService.onPartialTranscript(speaker, text);
             }
         });
 
