@@ -467,7 +467,7 @@ export class SummaryView extends LitElement {
         return html`
             <div class="insights-container">
                 ${!hasAnyContent
-                    ? html`<div class="empty-state">No insights yet...</div>`
+                    ? html`<div class="empty-state">Listening… answers appear here when a question is asked.</div>`
                     : html`
                         ${live
                             ? html`

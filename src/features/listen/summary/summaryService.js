@@ -43,9 +43,9 @@ class SummaryService {
         console.log(`💬 Added conversation text: ${conversationText}`);
         console.log(`📈 Total conversation history: ${this.conversationHistory.length} texts`);
 
-        // Live answers: when the other side of the call (system audio) asks
-        // something, answer it immediately instead of waiting for 5 turns.
-        if (speaker.toLowerCase() === 'them' && this.looksLikeQuestion(text)) {
+        // Live answers: when a question is heard (call audio or mic),
+        // answer it immediately instead of waiting for 5 turns.
+        if (this.looksLikeQuestion(text)) {
             this.answerLive(text.trim());
         }
 
@@ -82,7 +82,7 @@ class SummaryService {
                     role: 'system',
                     content:
                         'You are a real-time assistant on a live call. "them" is the other person; "me" is the user. ' +
-                        'When "them" asks a question, give the user an answer they can say out loud. ' +
+                        'Answer the question just asked so the user can say it out loud. ' +
                         'Be fast and direct: start with a one-sentence answer, then 2-3 short bullet points with the key ' +
                         'facts, numbers, examples, or reasoning. Economics questions are common: use correct terms and ' +
                         'brief intuition. No preamble, no headings, under 90 words total. Use "- " for bullets.',
