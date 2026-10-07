@@ -3,7 +3,9 @@ const { spawn } = require('child_process');
 const { createSTT } = require('../../common/ai/factory');
 const modelStateService = require('../../common/services/modelStateService');
 
-const COMPLETION_DEBOUNCE_MS = 2000;
+// How long a speaker must pause before their sentence counts as finished.
+// Lower = faster live answers; too low can split one question into two.
+const COMPLETION_DEBOUNCE_MS = 1100;
 
 // ── New heartbeat / renewal constants ────────────────────────────────────────────
 // Interval to send low-cost keep-alive messages so the remote service does not

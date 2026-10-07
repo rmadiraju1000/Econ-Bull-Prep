@@ -11,7 +11,9 @@ class SummaryService {
         this.analysisHistory = [];
         this.conversationHistory = [];
         this.currentSessionId = null;
-        
+        this.liveRequestId = 0;
+        this.lastLiveAnswer = null;
+
         // Callbacks
         this.onAnalysisComplete = null;
         this.onStatusUpdate = null;
@@ -41,8 +43,95 @@ class SummaryService {
         console.log(`💬 Added conversation text: ${conversationText}`);
         console.log(`📈 Total conversation history: ${this.conversationHistory.length} texts`);
 
+        // Live answers: when the other side of the call (system audio) asks
+        // something, answer it immediately instead of waiting for 5 turns.
+        if (speaker.toLowerCase() === 'them' && this.looksLikeQuestion(text)) {
+            this.answerLive(text.trim());
+        }
+
         // Trigger analysis if needed
         this.triggerAnalysisIfNeeded();
+    }
+
+    /**
+     * Speech-to-text often drops the "?", so also match question/prompt words.
+     */
+    looksLikeQuestion(text) {
+        const t = (text || '').trim();
+        if (t.split(/\s+/).length < 3) return false;
+        if (t.includes('?')) return true;
+        return /\b(what|why|how|when|where|who|which|explain|describe|define|tell (me|us)|walk (me|us) through|compare|contrast|calculate|give (me|us)|name|can you|could you|would you|do you|is it|are there|what's)\b/i.test(t);
+    }
+
+    async answerLive(question) {
+        const requestId = ++this.liveRequestId;
+        const startedAt = Date.now();
+        this.lastLiveAnswerAt = startedAt;
+
+        // Show the question right away so the panel reacts instantly.
+        const pending = this.buildLiveData(question, ['Thinking…']);
+        this.sendToRenderer('summary-update', pending);
+
+        try {
+            const modelInfo = await modelStateService.getCurrentModelInfo('llm');
+            if (!modelInfo || !modelInfo.apiKey) throw new Error('AI model or API key is not configured.');
+
+            const recent = this.formatConversationForPrompt(this.conversationHistory, 8);
+            const messages = [
+                {
+                    role: 'system',
+                    content:
+                        'You are a real-time assistant on a live call. "them" is the other person; "me" is the user. ' +
+                        'When "them" asks a question, give the user an answer they can say out loud. ' +
+                        'Be fast and direct: start with a one-sentence answer, then 2-3 short bullet points with the key ' +
+                        'facts, numbers, examples, or reasoning. Economics questions are common: use correct terms and ' +
+                        'brief intuition. No preamble, no headings, under 90 words total. Use "- " for bullets.',
+                },
+                {
+                    role: 'user',
+                    content: `Recent conversation:\n${recent}\n\nQuestion to answer now: ${question}`,
+                },
+            ];
+
+            const llm = createLLM(modelInfo.provider, {
+                apiKey: modelInfo.apiKey,
+                model: modelInfo.model,
+                temperature: 0.3,
+                maxTokens: 300,
+                usePortkey: modelInfo.provider === 'openai-glass',
+                portkeyVirtualKey: modelInfo.provider === 'openai-glass' ? modelInfo.apiKey : undefined,
+            });
+
+            const completion = await llm.chat(messages);
+            if (requestId !== this.liveRequestId) return; // a newer question superseded this one
+
+            const lines = (completion.content || '')
+                .split('\n')
+                .map(l => l.replace(/^\s*[-*•]\s*/, '').replace(/\*\*/g, '').trim())
+                .filter(Boolean);
+            console.log(`⚡ Live answer in ${Date.now() - startedAt}ms`);
+
+            const data = this.buildLiveData(question, lines.length ? lines : ['(No answer returned)']);
+            this.lastLiveAnswerAt = Date.now();
+            this.sendToRenderer('summary-update', data);
+        } catch (error) {
+            console.error('❌ Live answer failed:', error.message);
+            if (requestId === this.liveRequestId) {
+                this.sendToRenderer('summary-update', this.buildLiveData(question, [`Couldn't answer: ${error.message}`]));
+            }
+        }
+    }
+
+    buildLiveData(question, answerLines) {
+        const base = this.previousAnalysisResult || {
+            summary: [],
+            topic: { header: '', bullets: [] },
+            actions: [],
+            followUps: [],
+        };
+        const data = { ...base, liveAnswer: { question, lines: answerLines.slice(0, 5) } };
+        this.lastLiveAnswer = data.liveAnswer;
+        return data;
     }
 
     getConversationHistory() {
@@ -50,6 +139,7 @@ class SummaryService {
     }
 
     resetConversationHistory() {
+        this.lastLiveAnswer = null;
         this.conversationHistory = [];
         this.previousAnalysisResult = null;
         this.analysisHistory = [];
@@ -308,6 +398,8 @@ Keep all points concise and build upon previous analysis if provided.`,
 
             const data = await this.makeOutlineAndRequests(this.conversationHistory);
             if (data) {
+                // Keep the latest live answer pinned on top when the summary refreshes.
+                if (this.lastLiveAnswer) data.liveAnswer = this.lastLiveAnswer;
                 console.log('Sending structured data to renderer');
                 this.sendToRenderer('summary-update', data);
                 

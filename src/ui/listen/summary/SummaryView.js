@@ -460,13 +460,33 @@ export class SummaryView extends LitElement {
             actions: [],
         };
 
-        const hasAnyContent = data.summary.length > 0 || data.topic.bullets.length > 0 || data.actions.length > 0;
+        const live = data.liveAnswer;
+        const hasAnyContent =
+            !!live || data.summary.length > 0 || data.topic.bullets.length > 0 || data.actions.length > 0;
 
         return html`
             <div class="insights-container">
                 ${!hasAnyContent
                     ? html`<div class="empty-state">No insights yet...</div>`
                     : html`
+                        ${live
+                            ? html`
+                                  <insights-title>💡 ${live.question}</insights-title>
+                                  ${live.lines.map(
+                                      (line, index) => html`
+                                          <div
+                                              class="markdown-content"
+                                              data-markdown-id="live-${index}"
+                                              data-original-text="${line}"
+                                              style="font-weight: ${index === 0 ? '600' : '400'};"
+                                              @click=${() => this.handleMarkdownClick(line)}
+                                          >
+                                              ${line}
+                                          </div>
+                                      `
+                                  )}
+                              `
+                            : ''}
                         <insights-title>Current Summary</insights-title>
                         ${data.summary.length > 0
                             ? data.summary
