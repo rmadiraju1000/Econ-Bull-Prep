@@ -42,8 +42,9 @@ async function createSTT({ apiKey, language = "en-US", callbacks = {}, ...config
 
   const session = await liveClient.live.connect({
 
-    // gemini-live-2.5-flash-preview was shut down by Google; use the current Live model.
-    model: 'gemini-3.8-live',
+    // Dedicated low-latency transcription model: streams interim (partial)
+    // text while someone is speaking, then a final transcript on each pause.
+    model: 'gemini-3.5-transcribe-live',
     callbacks: {
       ...callbacks,
       onMessage: (msg) => {
@@ -54,8 +55,8 @@ async function createSTT({ apiKey, language = "en-US", callbacks = {}, ...config
     },
 
     config: {
-      inputAudioTranscription: {},
-      speechConfig: { languageCode: lang },
+      responseModalities: ['TEXT'],
+      inputAudioTranscription: { languageCodes: [lang] },
     },
   })
 

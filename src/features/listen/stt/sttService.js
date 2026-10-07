@@ -76,7 +76,7 @@ class SttService {
     }
 
     flushMyCompletion() {
-        const finalText = (this.myCompletionBuffer + this.myCurrentUtterance).trim();
+        const finalText = [this.myCompletionBuffer, this.myCurrentUtterance].map(t => (t || '').trim()).filter(Boolean).join(' ');
         if (!this.modelInfo || !finalText) return;
 
         // Notify completion callback
@@ -103,7 +103,7 @@ class SttService {
     }
 
     flushTheirCompletion() {
-        const finalText = (this.theirCompletionBuffer + this.theirCurrentUtterance).trim();
+        const finalText = [this.theirCompletionBuffer, this.theirCurrentUtterance].map(t => (t || '').trim()).filter(Boolean).join(' ');
         if (!this.modelInfo || !finalText) return;
         
         // Notify completion callback
@@ -149,6 +149,58 @@ class SttService {
 
         if (this.theirCompletionTimer) clearTimeout(this.theirCompletionTimer);
         this.theirCompletionTimer = setTimeout(() => this.flushTheirCompletion(), COMPLETION_DEBOUNCE_MS);
+    }
+
+    /**
+     * Gemini transcribe-live sends:
+     *  - serverContent.interimInputTranscription: fast partial text while speaking
+     *  - serverContent.inputTranscription: final text for a segment after a pause
+     *  - serverContent.turnComplete: end of the speaker's turn
+     * Interim text is shown immediately (and keeps the sentence "open");
+     * final text is committed to the buffer and debounced into a full turn.
+     */
+    handleGeminiTranscript(message, speaker) {
+        const isMe = speaker === 'Me';
+        const content = message?.serverContent;
+        if (!content) {
+            if (message?.error) console.error(`[Gemini STT - ${speaker}]`, message.error);
+            return;
+        }
+
+        const bufferKey = isMe ? 'myCompletionBuffer' : 'theirCompletionBuffer';
+        const interimKey = isMe ? 'myCurrentUtterance' : 'theirCurrentUtterance';
+        const timerKey = isMe ? 'myCompletionTimer' : 'theirCompletionTimer';
+        const flush = () => (isMe ? this.flushMyCompletion() : this.flushTheirCompletion());
+        const clean = t => (t && t.trim() && t.trim() !== '<noise>' ? t : '');
+        const join = (a, b) => (!a ? b : !b ? a : /\s$/.test(a) || /^\s/.test(b) ? a + b : `${a} ${b}`);
+
+        const interim = clean(content.interimInputTranscription?.text);
+        const final = clean(content.inputTranscription?.text);
+
+        if (final) {
+            this[bufferKey] = join(this[bufferKey], final);
+            this[interimKey] = '';
+        } else if (interim) {
+            this[interimKey] = interim;
+        }
+
+        if (final || interim) {
+            // Still talking: push the live text and restart the end-of-sentence timer.
+            this.sendToRenderer('stt-update', {
+                speaker,
+                text: join(this[bufferKey], this[interimKey]).trim(),
+                isPartial: true,
+                isFinal: false,
+                timestamp: Date.now(),
+            });
+            if (this[timerKey]) clearTimeout(this[timerKey]);
+            this[timerKey] = setTimeout(flush, COMPLETION_DEBOUNCE_MS);
+        }
+
+        if (content.turnComplete && (this[bufferKey] || this[interimKey])) {
+            if (this[timerKey]) clearTimeout(this[timerKey]);
+            flush();
+        }
     }
 
     async initializeSttSessions(language = 'en') {
@@ -208,36 +260,8 @@ class SttService {
                 }
                 return;
             } else if (this.modelInfo.provider === 'gemini') {
-                if (!message.serverContent?.modelTurn) {
-                    console.log('[Gemini STT - Me]', JSON.stringify(message, null, 2));
-                }
+                this.handleGeminiTranscript(message, 'Me');
 
-                if (message.serverContent?.turnComplete) {
-                    if (this.myCompletionTimer) {
-                        clearTimeout(this.myCompletionTimer);
-                        this.flushMyCompletion();
-                    }
-                    return;
-                }
-            
-                const transcription = message.serverContent?.inputTranscription;
-                if (!transcription || !transcription.text) return;
-                
-                const textChunk = transcription.text;
-                if (!textChunk.trim() || textChunk.trim() === '<noise>') {
-                    return; // 1. Ignore whitespace-only chunks or noise
-                }
-            
-                this.debounceMyCompletion(textChunk);
-                
-                this.sendToRenderer('stt-update', {
-                    speaker: 'Me',
-                    text: this.myCompletionBuffer,
-                    isPartial: true,
-                    isFinal: false,
-                    timestamp: Date.now(),
-                });
-                
             // Deepgram 
             } else if (this.modelInfo.provider === 'deepgram') {
                 const text = message.channel?.alternatives?.[0]?.transcript;
@@ -350,35 +374,7 @@ class SttService {
                 }
                 return;
             } else if (this.modelInfo.provider === 'gemini') {
-                if (!message.serverContent?.modelTurn) {
-                    console.log('[Gemini STT - Them]', JSON.stringify(message, null, 2));
-                }
-
-                if (message.serverContent?.turnComplete) {
-                    if (this.theirCompletionTimer) {
-                        clearTimeout(this.theirCompletionTimer);
-                        this.flushTheirCompletion();
-                    }
-                    return;
-                }
-            
-                const transcription = message.serverContent?.inputTranscription;
-                if (!transcription || !transcription.text) return;
-
-                const textChunk = transcription.text;
-                if (!textChunk.trim() || textChunk.trim() === '<noise>') {
-                    return; // 1. Ignore whitespace-only chunks or noise
-                }
-
-                this.debounceTheirCompletion(textChunk);
-                
-                this.sendToRenderer('stt-update', {
-                    speaker: 'Them',
-                    text: this.theirCompletionBuffer,
-                    isPartial: true,
-                    isFinal: false,
-                    timestamp: Date.now(),
-                });
+                this.handleGeminiTranscript(message, 'Them');
 
             // Deepgram
             } else if (this.modelInfo.provider === 'deepgram') {
