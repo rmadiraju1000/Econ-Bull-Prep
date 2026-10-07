@@ -3,7 +3,7 @@
 const key = process.env.GEMINI_API_KEY;
 if (!key) { console.error("Set GEMINI_API_KEY first."); process.exit(1); }
 
-const models = ["gemini-2.5-flash-lite", "gemini-2.5-flash"];
+const models = ["gemini-3.5-flash-lite", "gemini-3.8-flash"];
 const prompt = "In an economics interview: explain the difference between a bull and bear market in two sentences.";
 
 for (const model of models) {

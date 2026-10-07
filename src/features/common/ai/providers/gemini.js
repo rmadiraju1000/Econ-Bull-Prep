@@ -42,7 +42,8 @@ async function createSTT({ apiKey, language = "en-US", callbacks = {}, ...config
 
   const session = await liveClient.live.connect({
 
-    model: 'gemini-live-2.5-flash-preview',
+    // gemini-live-2.5-flash-preview was shut down by Google; use the current Live model.
+    model: 'gemini-3.8-live',
     callbacks: {
       ...callbacks,
       onMessage: (msg) => {
@@ -67,7 +68,7 @@ async function createSTT({ apiKey, language = "en-US", callbacks = {}, ...config
 /**
  * Creates a Gemini LLM instance with proper text response handling
  */
-function createLLM({ apiKey, model = "gemini-2.5-flash", temperature = 0.7, maxTokens = 8192, ...config }) {
+function createLLM({ apiKey, model = "gemini-3.5-flash-lite", temperature = 0.7, maxTokens = 8192, ...config }) {
   const client = new GoogleGenerativeAI(apiKey)
 
   return {
@@ -201,7 +202,7 @@ function createLLM({ apiKey, model = "gemini-2.5-flash", temperature = 0.7, maxT
 /**
  * Creates a Gemini streaming LLM instance with text response fix
  */
-function createStreamingLLM({ apiKey, model = "gemini-2.5-flash", temperature = 0.7, maxTokens = 8192, ...config }) {
+function createStreamingLLM({ apiKey, model = "gemini-3.5-flash-lite", temperature = 0.7, maxTokens = 8192, ...config }) {
   const client = new GoogleGenerativeAI(apiKey)
 
   return {
