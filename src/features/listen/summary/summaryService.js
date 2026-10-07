@@ -56,7 +56,10 @@ class SummaryService {
         // Live answers: when a question is heard (call audio or mic), answer it
         // immediately. If we already started answering this question from the
         // partial transcript, keep that answer instead of starting over.
-        if (this.looksLikeQuestion(text)) {
+        const isQuestion = this.looksLikeQuestion(text);
+        const isSubstantialFromThem =
+            speaker.toLowerCase() === 'them' && text.trim().split(/\s+/).length >= 6;
+        if (isQuestion || isSubstantialFromThem) {
             const q = text.trim();
             if (!this.isSameQuestion(this.activeQuestion, q)) {
                 this.answerLive(q);
@@ -141,12 +144,13 @@ class SummaryService {
             const recent = this.formatConversationForPrompt(this.conversationHistory, 8);
             const system =
                 'You are a real-time assistant on a live call. "them" is the other person; "me" is the user. ' +
-                'Answer the question just asked so the user can say it out loud right away. ' +
+                'If the latest line is a question, answer it so the user can say it out loud right away. ' +
+                'If it is a statement, give the best thing for the user to say or know in response. ' +
                 'Line 1: the direct answer in one short sentence. Then 2-3 bullets ("- ") with the key facts, ' +
                 'numbers, examples or reasoning. Economics questions are common: use correct terms and brief ' +
                 'intuition. The question may be cut off mid-sentence; answer the most likely full question. ' +
                 'No preamble, no headings, under 80 words.';
-            const user = `Recent conversation:\n${recent}\n\nQuestion to answer now: ${question}`;
+            const user = `Recent conversation:\n${recent}\n\nLatest line to respond to now: ${question}`;
 
             let firstTokenAt = 0;
             let lastPush = 0;

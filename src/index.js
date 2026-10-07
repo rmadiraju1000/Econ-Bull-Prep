@@ -7,6 +7,26 @@
 
 require('dotenv').config();
 
+// Mirror all main-process logs to glass.log in the project folder (overwritten
+// each launch) so problems can be diagnosed without scrolling the Terminal.
+(() => {
+    try {
+        const fs = require('node:fs');
+        const util = require('node:util');
+        const logPath = require('node:path').join(__dirname, '..', 'glass.log');
+        const stream = fs.createWriteStream(logPath, { flags: 'w' });
+        for (const level of ['log', 'info', 'warn', 'error']) {
+            const original = console[level].bind(console);
+            console[level] = (...args) => {
+                original(...args);
+                try {
+                    stream.write(`${new Date().toISOString()} [${level}] ${util.format(...args)}\n`);
+                } catch (_) {}
+            };
+        }
+    } catch (_) {}
+})();
+
 if (require('electron-squirrel-startup')) {
     process.exit(0);
 }

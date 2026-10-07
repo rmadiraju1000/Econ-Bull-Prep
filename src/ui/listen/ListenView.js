@@ -476,6 +476,15 @@ export class ListenView extends LitElement {
                     this.requestUpdate();
                 }
             });
+
+            // When a live answer arrives, jump to the Insights tab and grow the
+            // window to fit it (otherwise the answer can be hidden or clipped).
+            window.api.summaryView.onSummaryUpdate((event, data) => {
+                if (data?.liveAnswer && this.viewMode !== 'insights') {
+                    this.viewMode = 'insights';
+                }
+                this.updateComplete.then(() => setTimeout(() => this.adjustWindowHeight(), 30));
+            });
         }
     }
 
