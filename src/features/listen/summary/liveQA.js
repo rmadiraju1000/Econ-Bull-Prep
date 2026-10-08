@@ -9,6 +9,7 @@
 
 const modelStateService = require('../../common/services/modelStateService');
 const { streamAnswer } = require('./fastAnswer');
+const { liveModels } = require('../../common/ai/providers/groq');
 
 const SPECULATIVE_PAUSE_MS = 450; // live text must be stable this long before an early answer
 const MIN_GAP_MS = 1500; // minimum time between two answer requests
@@ -66,6 +67,7 @@ class LiveQA {
         this.backoffUntil = 0;
         this.speculativeHeard = null; // text an early answer was started from, for this utterance
         this.earlyFailed = false; // the early answer for this utterance errored out
+        this.deadModels = this.deadModels || new Set(); // models that returned 'not found' — skip them
         this.status = 'idle';
         this.statusDetail = '';
         if (!silent) this.publish();
@@ -76,7 +78,10 @@ class LiveQA {
         const t = (text || '').trim();
         if (t.split(/\s+/).length < 3) return false;
         const tail = lastWords(t, 25);
-        return tail.includes('?') || QUESTION_RE.test(tail);
+        // A bare "?" (e.g. "Are you sure?", "Paris Agreement?") isn't enough on its
+        // own: also require a question word or a longer sentence.
+        if (QUESTION_RE.test(tail)) return true;
+        return tail.includes('?') && t.split(/\s+/).length >= 6;
     }
 
     /** Live (partial) transcript while someone is talking. */
@@ -147,7 +152,11 @@ class LiveQA {
         } catch (_) {}
         const selected = await modelStateService.getCurrentModelInfo('llm').catch(() => null);
 
-        if (keys.groq) add('groq', keys.groq, selected?.provider === 'groq' ? selected.model : GROQ_LIVE_MODEL);
+        if (keys.groq) {
+            // Ask Groq which models this key can use (cached), best first; try up to two.
+            const groqModels = await liveModels(keys.groq, selected?.provider === 'groq' ? selected.model : GROQ_LIVE_MODEL);
+            groqModels.filter(m => !this.deadModels.has(`groq/${m}`)).slice(0, 2).forEach(m => add('groq', keys.groq, m));
+        }
         if (selected?.apiKey) add(selected.provider, selected.apiKey, selected.model);
         if (keys.gemini) GEMINI_BACKUP_MODELS.forEach(m => add('gemini', keys.gemini, m));
         return list;
@@ -235,6 +244,8 @@ class LiveQA {
                 if (seq !== this.requestSeq) return;
                 if (!full.trim()) throw new Error('Empty response');
                 render(full, true);
+                const p = this.parse(full, true);
+                console.log(`📝 [LiveQA] Q: ${p.none ? 'NONE' : p.question} | A: ${p.answer} | ${p.points.join(' / ')}`);
                 console.log(`⚡ [LiveQA] Done in ${Date.now() - startedAt}ms (attempt took ${Date.now() - t0}ms)`);
                 this.setStatus('idle');
                 return;
@@ -242,6 +253,9 @@ class LiveQA {
                 if (abort.signal.aborted || seq !== this.requestSeq) return; // superseded by a newer question
                 const msg = error.name === 'AbortError' ? `no response within ${FIRST_TOKEN_TIMEOUT_MS}ms` : error.message || String(error);
                 console.error(`❌ [LiveQA] ${m.provider}/${m.model} failed: ${msg.slice(0, 200)}`);
+                if (/\b404\b|model_not_found|does not exist|not found/i.test(msg)) {
+                    this.deadModels.add(`${m.provider}/${m.model}`); // don't waste time on it again
+                }
                 lastError = new Error(msg);
                 if (firstAt) break; // it had started streaming; don't restart mid-answer
             } finally {

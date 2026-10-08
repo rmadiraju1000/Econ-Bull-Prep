@@ -22,6 +22,50 @@ class GroqProvider {
     }
 }
 
+// Which chat models this key can actually use. Model availability differs by
+// account and changes over time, so ask Groq instead of hard-coding one ID.
+const PREFERRED_LIVE_MODELS = [
+    'llama-3.3-70b-versatile',
+    'openai/gpt-oss-20b',
+    'openai/gpt-oss-120b',
+    'llama-3.1-8b-instant',
+];
+const NON_CHAT = /whisper|tts|orpheus|guard|playai|distil|compound|allam/i;
+let modelCache = { key: null, at: 0, ids: [] };
+
+async function listModels(apiKey) {
+    if (modelCache.key === apiKey && Date.now() - modelCache.at < 30 * 60 * 1000 && modelCache.ids.length) {
+        return modelCache.ids;
+    }
+    const res = await fetch(`${BASE_URL}/models`, { headers: { Authorization: `Bearer ${apiKey}` } });
+    if (!res.ok) throw new Error(`Groq models ${res.status}`);
+    const json = await res.json();
+    const ids = (json.data || [])
+        .filter(m => m.active !== false && !NON_CHAT.test(m.id))
+        .map(m => m.id);
+    modelCache = { key: apiKey, at: Date.now(), ids };
+    console.log(`[GroqProvider] Models available to this key: ${ids.join(', ')}`);
+    return ids;
+}
+
+/**
+ * Best available chat models for live answers, in preference order.
+ * Falls back to whatever chat models the key has if none of the preferred ones exist.
+ */
+async function liveModels(apiKey, preferred) {
+    let ids = [];
+    try {
+        ids = await listModels(apiKey);
+    } catch (e) {
+        console.warn('[GroqProvider] Could not list models:', e.message);
+        return preferred ? [preferred, ...PREFERRED_LIVE_MODELS] : PREFERRED_LIVE_MODELS;
+    }
+    const order = [preferred, ...PREFERRED_LIVE_MODELS].filter(Boolean);
+    const picked = order.filter((m, i) => ids.includes(m) && order.indexOf(m) === i);
+    const others = ids.filter(m => !picked.includes(m));
+    return [...picked, ...others];
+}
+
 // Groq's text models don't take images: keep only the text parts.
 function toTextMessages(messages) {
     return messages.map(m => {
@@ -88,4 +132,4 @@ function createStreamingLLM({ apiKey, model = 'llama-3.3-70b-versatile', tempera
     };
 }
 
-module.exports = { GroqProvider, createLLM, createStreamingLLM };
+module.exports = { GroqProvider, createLLM, createStreamingLLM, listModels, liveModels };
