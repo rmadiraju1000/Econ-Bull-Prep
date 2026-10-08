@@ -15,7 +15,8 @@ const modelStateService = require('../../common/services/modelStateService');
 const { streamAnswer } = require('./fastAnswer');
 const { listModels } = require('../../common/ai/providers/groq');
 
-const SPECULATIVE_PAUSE_MS = 600; // live text must be stable this long before an early answer
+const SPECULATIVE_PAUSE_MS = 600; // live text must be stable this long before an early answer (no clear question end)
+const QUICK_PAUSE_MS = 150; // a clearly finished question in the live text: answer almost immediately
 const MIN_GAP_MS = 1500; // minimum time between two answer requests
 const RATE_LIMIT_BACKOFF_MS = 15000; // pause after a 429 from the provider
 const FIRST_TOKEN_TIMEOUT_MS = 4000; // if a model hasn't started answering by then, try the next one
@@ -47,6 +48,7 @@ const SYSTEM_PROMPT = [
     '- Q: SAME   if the main question is one already answered (listed below), or the latest lines are only teams/people giving answers, scores, timers ("20 seconds", "boards up"), "repeat your answer", or chatter.',
     '- Q: NONE   if no real question is being asked yet (for example the question is still cut off and cannot be answered).',
     'Never treat someone\'s spoken answer as the correct answer; work it out yourself.',
+    'Quiz cues: a timer like "20 seconds" right after a sentence means that sentence was the question. A sentence ending in "is also known as" / "is called" / "is referred to as" is a fill-in-the-blank: answer with the term.',
     'Economics: use correct terms, get the DIRECTION of every effect right (which curve shifts, left or right; who bears a tax: the more inelastic side), and do any arithmetic step by step before answering. Keep the visible answer under 80 words.',
 ].join('\n');
 
@@ -60,7 +62,7 @@ const VERIFY_PROMPT = [
 
 // Broad check for a finished sentence (used for finished turns).
 const QUESTION_RE =
-    /\b(what|why|how|where|who|whom|whose|which|explain|describe|define|tell (me|us)|walk (me|us) through|compare|contrast|calculate|compute|give (me|us)|can you|could you|would you|do you|did you|have you|is it|is there|are there|what's|should|name (the|this|a)|identify|true or false|this (economist|term|concept|curve|law|theory|policy|type|principle|measure|tax|market|index|agency|act))\b/i;
+    /\b(what|why|how|where|who|whom|whose|which|explain|describe|define|tell (me|us)|walk (me|us) through|compare|contrast|calculate|compute|give (me|us)|can you|could you|would you|do you|did you|have you|is it|is there|are there|what's|should|name (the|this|a)|identify|true or false|known as|referred to as|is called|also called|term for|this (economist|term|concept|curve|law|theory|policy|type|principle|measure|tax|market|index|agency|act))\b/i;
 // Stricter check for EARLY answers from the live transcript.
 const STRONG_Q_RE =
     /\b(what|which|who|whom|whose|why|how|name (the|this|a)|identify|explain|describe|define|calculate|compute|true or false|this (economist|term|concept|curve|law|theory|policy|type|principle|measure|tax|market|index|agency|act))\b/i;
@@ -80,6 +82,62 @@ function lastWords(text, n) {
 const STOP = new Set('the a an of to in on for and or is are was be what which who how why does do did will would this that it its with by as at from'.split(' '));
 function contentWords(t) {
     return new Set(normalize(t).split(' ').filter(w => w.length > 2 && !STOP.has(w)));
+}
+const TIMER_RE = /^\W*(it'?s\s+)?(\d+|five|ten|fifteen|twenty|thirty|forty|sixty)\s+seconds?\W*$/i;
+const FILL_IN_END_RE = /\b(known as|referred to as|called|termed|named|the term for)\s*[.?!]*$/i;
+function wordCount(t) {
+    return (t || '').trim().split(/\s+/).filter(Boolean).length;
+}
+/**
+ * Find a question that has been COMPLETELY spoken in the live text, even if the
+ * speaker kept talking ("…what law? 20 seconds."). Looks at the last few sentences.
+ * Returns { question, context } or null.
+ */
+const TRAILING_TIMER_RE = /\s+((?:it'?s\s+)?(?:\d+|five|ten|fifteen|twenty|thirty|forty|sixty)\s+seconds?)\W*$/i;
+function completedQuestion(text) {
+    // "…is also known as 20 seconds" (no punctuation): split the timer off as its own sentence.
+    text = (text || '').replace(TRAILING_TIMER_RE, (m, t, off, all) => (/[.?!]$/.test(all.slice(0, off)) ? m : `. ${t}.`));
+    const sentences = ((text || '').match(/[^.?!]+[.?!]+|[^.?!]+$/g) || []).map(x => x.trim()).filter(Boolean);
+    for (let i = sentences.length - 1; i >= Math.max(0, sentences.length - 4); i--) {
+        const s = sentences[i];
+        const next = sentences[i + 1] || '';
+        const finished = /[.?!]$/.test(s) || !!next;
+        if (!finished || TIMER_RE.test(s)) continue;
+        const words = wordCount(s);
+        const timerAfter = TIMER_RE.test(next);
+        const isQuestion =
+            (s.endsWith('?') && words >= 4 && (STRONG_Q_RE.test(s) || words >= 7)) ||
+            (FILL_IN_END_RE.test(s) && words >= 5) ||
+            (timerAfter && words >= 5);
+        if (isQuestion) {
+            return { question: s, context: sentences.slice(Math.max(0, i - 3), i + 1).join(' ') };
+        }
+    }
+    return null;
+}
+function numbersIn(t) {
+    return ((t || '').match(/\d+(?:\.\d+)?/g) || []).sort().join(',');
+}
+/** Same question? Needs most words in common AND the same numbers. */
+function sameQuestion(a, b) {
+    if (numbersIn(a) !== numbersIn(b)) return false;
+    const A = contentWords(a);
+    const B = contentWords(b);
+    if (!A.size || !B.size) return false;
+    let n = 0;
+    A.forEach(w => B.has(w) && n++);
+    return n / (A.size + B.size - n) >= 0.5; // Jaccard
+}
+const DIR_RE = /\b(left|right|increas\w*|decreas\w*|rise|rises|rising|fall|falls|falling|up|down|higher|lower|more|less|fewer|consumers?|producers?|buyers?|sellers?|surplus|shortage|elastic|inelastic|unchanged|no change|true|false)\b/gi;
+function directions(t) {
+    const norm = w => w.toLowerCase().replace(/^increas.*|^ris.*|^higher|^up$/, 'up').replace(/^decreas.*|^fall.*|^lower|^down$/, 'down').replace(/s$/, '');
+    return [...new Set(((t || '').match(DIR_RE) || []).map(norm))].sort().join(',');
+}
+/** Do the quick and the smart answer say the same thing? (headline only) */
+function answersAgree(a, b) {
+    if (directions(a) !== directions(b)) return false;
+    if (numbersIn(a) !== numbersIn(b)) return false;
+    return similarity(a, b) >= 0.5 || normalize(a).includes(normalize(b)) || normalize(b).includes(normalize(a));
 }
 function similarity(a, b) {
     const A = contentWords(a);
@@ -167,6 +225,7 @@ class LiveQA {
         if (t.split(/\s+/).length < 3) return false;
         const tail = lastWords(t, 25);
         if (QUESTION_RE.test(tail)) return true;
+        if (completedQuestion(t)) return true;
         return tail.includes('?') && t.split(/\s+/).length >= 6;
     }
 
@@ -204,23 +263,50 @@ class LiveQA {
     onPartial(speaker, text) {
         if (speaker === 'Them') this.rememberThem(text);
         const st = this.early[speaker] || (this.early[speaker] = {});
-        clearTimeout(this.partialTimers[speaker]);
-        if (st.heard) return; // already started early for this utterance
-        if (this.ignored(speaker, text)) return;
-        if (!this.readyForEarlyAnswer(text)) return;
+        st.fired = st.fired || [];
+        if (this.ignored(speaker, text)) {
+            clearTimeout(this.partialTimers[speaker]);
+            return;
+        }
 
-        this.partialTimers[speaker] = setTimeout(() => {
-            const skip = this.blockedReason(true);
-            if (skip) {
-                console.log(`[LiveQA] Skipping early answer: ${skip}`);
-                return; // the finished question will still be answered
-            }
-            st.heard = text.trim();
-            st.failed = false;
-            st.seq = this.requestSeq + 1;
-            console.log(`⚡ [LiveQA] Early answer from partial (${speaker}): "${lastWords(text, 20)}"`);
-            this.request({ speculative: true, heard: text.trim(), speaker });
-        }, SPECULATIVE_PAUSE_MS);
+        // 1) A question has been fully spoken (ends in "?", fill-in, or timer cue
+        //    after it) — answer right away, even if the speaker keeps talking.
+        const cq = completedQuestion(text);
+        if (cq) {
+            if (st.fired.some(k => sameQuestion(k, cq.question))) return; // already answering this one
+            // Same question already queued: don't restart the short wait on every partial.
+            if (this.pendingQ?.[speaker] && sameQuestion(this.pendingQ[speaker], cq.question)) return;
+            clearTimeout(this.partialTimers[speaker]);
+            this.pendingQ = { ...(this.pendingQ || {}), [speaker]: cq.question };
+            this.partialTimers[speaker] = setTimeout(() => {
+                this.pendingQ[speaker] = null;
+                this.fireEarly(speaker, cq.context, cq.question, true);
+            }, QUICK_PAUSE_MS);
+            return;
+        }
+        clearTimeout(this.partialTimers[speaker]);
+        if (this.pendingQ) this.pendingQ[speaker] = null;
+
+        // 2) Otherwise, only when the live text clearly ends in a question and settles.
+        if (st.heard) return;
+        if (!this.readyForEarlyAnswer(text)) return;
+        this.partialTimers[speaker] = setTimeout(() => this.fireEarly(speaker, text.trim(), text.trim(), false), SPECULATIVE_PAUSE_MS);
+    }
+
+    fireEarly(speaker, heard, questionText, complete) {
+        const st = this.early[speaker] || (this.early[speaker] = {});
+        st.fired = st.fired || [];
+        const skip = this.blockedReason(!complete); // a clearly finished new question skips the min-gap rule
+        if (skip) {
+            console.log(`[LiveQA] Skipping early answer: ${skip}`);
+            return; // the finished turn will still be answered
+        }
+        st.heard = heard;
+        st.fired.push(questionText);
+        st.failed = false;
+        st.seq = this.requestSeq + 1;
+        console.log(`⚡ [LiveQA] Early answer from partial (${speaker}${complete ? ', question complete' : ''}): "${lastWords(questionText, 22)}"`);
+        this.request({ speculative: true, heard, speaker });
     }
 
     onFinalTurn(speaker, text, history) {
@@ -228,9 +314,11 @@ class LiveQA {
         if (speaker === 'Them') this.rememberThem(text);
         const st = this.early[speaker] || (this.early[speaker] = {});
         clearTimeout(this.partialTimers[speaker]);
+        if (this.pendingQ) this.pendingQ[speaker] = null;
         const heardEarly = st.failed ? null : st.heard;
         const earlySeq = st.seq;
         const earlyCardId = st.cardId;
+        const fired = st.failed ? [] : st.fired || [];
         this.early[speaker] = {};
 
         const why = this.ignored(speaker, text);
@@ -240,8 +328,18 @@ class LiveQA {
         }
         if (!this.looksLikeQuestion(text)) return;
 
+        // The last complete question in this turn was already answered early: confirm it.
+        const lastQ = completedQuestion(text);
+        if (lastQ && fired.some(k => sameQuestion(k, lastQ.question))) {
+            console.log('[LiveQA] Final turn matches early answer, keeping it');
+            this.markTiming(earlySeq, 'endAt');
+            if (earlySeq) this.confirmedSeqs.add(earlySeq);
+            this.confirmDraft(earlyCardId);
+            return;
+        }
+
         // The early answer already covered this question: confirm the draft.
-        if (heardEarly) {
+        if (heardEarly && !lastQ) {
             const a = normalize(heardEarly);
             const b = normalize(text);
             if (b.startsWith(a.slice(0, Math.max(0, a.length - 5))) && b.length - a.length <= 40) {
@@ -269,7 +367,7 @@ class LiveQA {
         if (card.status === 'done') this.maybeVerify(card);
     }
 
-    blockedReason(speculative) {
+    blockedReason(speculative) { // speculative=false also used for "clearly finished new question"
         const now = Date.now();
         if (now < this.backoffUntil) return 'rate-limit back-off';
         if (speculative && now - this.lastRequestAt < MIN_GAP_MS) return 'too soon after the last request';
@@ -330,9 +428,7 @@ class LiveQA {
     /** A recent finished card asking essentially the same question. */
     findSimilar(question, excludeId) {
         const now = Date.now();
-        return this.cards.find(
-            c => c.id !== excludeId && now - c.updatedAt < CARD_MEMORY_MS && similarity(c.question, question) >= SIMILAR_QUESTION
-        );
+        return this.cards.find(c => c.id !== excludeId && now - c.updatedAt < CARD_MEMORY_MS && sameQuestion(c.question, question));
     }
 
     newCard(question, fields) {
@@ -444,9 +540,37 @@ class LiveQA {
         const models = await this.candidates(hard);
         if (!models.length) lastError = new Error('No AI model or API key is configured.');
 
+        // Hard question: run the quick model and the smart model AT THE SAME TIME.
+        // Show the quick answer right away; the smart one confirms or corrects it.
+        let smartRun = null;
+        let smartInfo = null;
+        if (hard && models[0]?.provider === 'groq' && models[0].effort === 'medium') {
+            const fastIdx = models.findIndex((c, i) => i > 0 && c.provider === 'groq');
+            if (fastIdx > 0) {
+                smartInfo = models[0];
+                models.unshift(models.splice(fastIdx, 1)[0]);
+                smartRun = streamAnswer({
+                    provider: smartInfo.provider,
+                    apiKey: smartInfo.apiKey,
+                    model: smartInfo.model,
+                    reasoningEffort: 'medium',
+                    system: SYSTEM_PROMPT,
+                    user,
+                    temperature: 0.2,
+                    maxTokens: 1500,
+                    signal: abort.signal,
+                    onDelta: () => {},
+                })
+                    .then(full => ({ full, ms: Date.now() - startedAt }))
+                    .catch(error => ({ error }));
+            }
+        }
+
+        let fastDone = false;
         const downProviders = new Set(); // provider timed out / overloaded: skip its other models this time
         for (const m of models) {
             if (seq !== this.requestSeq || outcome === 'skip') break;
+            if (m === smartInfo) continue; // already running in parallel
             if (downProviders.has(m.provider)) continue;
             const attempt = new AbortController();
             const onOuterAbort = () => attempt.abort();
@@ -486,6 +610,14 @@ class LiveQA {
                 const tag = p.same ? 'SAME' : p.none ? 'NONE' : p.question;
                 console.log(`📝 [LiveQA] (#${seq}) Q: ${tag} | A: ${p.answer} | ${p.points.join(' / ')}`);
                 console.log(`⚡ [LiveQA] Done in ${Date.now() - startedAt}ms (attempt took ${Date.now() - t0}ms)`);
+                if (smartRun) {
+                    fastDone = true;
+                    if (card && outcome === 'answered') {
+                        card.checking = true;
+                        this.publish();
+                    }
+                    break;
+                }
                 const stale = replaceCardId && this.cards.find(c => c.id === replaceCardId);
                 if (stale && stale.draft && outcome !== 'answered') {
                     // The early draft guessed a question that turned out not to be one.
@@ -514,6 +646,50 @@ class LiveQA {
             return;
         }
         if (seq !== this.requestSeq) return;
+
+        if (smartRun) {
+            const r = await smartRun;
+            if (seq !== this.requestSeq || outcome === 'skip') return;
+            if (card) card.checking = false;
+            const p = !r.error && r.full.trim() ? this.parse(r.full, true) : null;
+            const smartAnswered = p && !p.none && !p.same && p.answer;
+            if (r.error) console.error(`❌ [LiveQA] ${smartInfo.model} review error: ${(r.error.message || r.error).toString().slice(0, 160)}`);
+            if (p) {
+                const tag = p.same ? 'SAME' : p.none ? 'NONE' : p.answer;
+                console.log(`🔍 [LiveQA] 120B review (#${seq}) in ${r.ms}ms: ${tag}`);
+            }
+            if (outcome === 'answered' && card) {
+                if (smartAnswered) {
+                    const quick = `${card.answer}`;
+                    if (answersAgree(quick, p.answer)) {
+                        card.verified = true;
+                        console.log(`🔍 [LiveQA] 120B agrees (#${seq}) | ${quick}`);
+                    } else {
+                        console.log(`🔍 [LiveQA] 120B CORRECTED (#${seq}) | was: ${quick} | now: ${p.answer}`);
+                        Object.assign(card, { answer: p.answer, points: p.points.length ? p.points : card.points, corrected: true, model: smartInfo.model });
+                    }
+                    card.updatedAt = Date.now();
+                }
+                this.publish();
+                this.setStatus('idle');
+                return;
+            }
+            if (smartAnswered && p.question) {
+                // Quick model failed or said "no question" but the smart model found one.
+                usedModel = smartInfo;
+                firstMs = r.ms;
+                render(r.full, true);
+                console.log(`📝 [LiveQA] (#${seq}) Q: ${p.question} | A: ${p.answer} | ${p.points.join(' / ')}`);
+                this.setStatus('idle');
+                return;
+            }
+            if (fastDone) {
+                const stale = replaceCardId && this.cards.find(c => c.id === replaceCardId);
+                if (stale && stale.draft) this.removeCard(replaceCardId);
+                this.setStatus('idle');
+                return;
+            }
+        }
         if (speculative && this.early[speaker]) this.early[speaker].failed = true;
         const msg = lastError?.message || 'Unknown error';
         if (/\b429\b|rate.?limit|quota|RESOURCE_EXHAUSTED/i.test(msg) && models.length <= 1) {

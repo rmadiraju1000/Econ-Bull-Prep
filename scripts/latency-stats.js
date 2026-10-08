@@ -71,6 +71,12 @@ for (const l of lines) {
         verify.ms.push(+m[2]);
         if (m[1] === 'CORRECTED') verify.fixes.push(m[3].replace(/^.*?\| /, '').slice(0, 160));
     } else if (/Double-check failed/.test(l)) verify.failed++;
+    else if ((m = l.match(/🔍 \[LiveQA\] 120B review \(#\d+\) in (\d+)ms/))) verify.ms.push(+m[1]);
+    else if (/🔍 \[LiveQA\] 120B agrees/.test(l)) verify.ok++;
+    else if ((m = l.match(/🔍 \[LiveQA\] 120B CORRECTED \(#\d+\) \| (.*)/))) {
+        verify.corrected++;
+        verify.fixes.push(m[1].slice(0, 160));
+    }
     else if ((m = l.match(/🏷 \[LiveQA\] Rated (CORRECT|WRONG) \(#\d+, ([^)]*)\) \| Q: (.*?) \| A: (.*)/))) {
         ratings.push({ verdict: m[1], model: m[2], q: m[3], a: m[4] });
     } else if ((m = l.match(/❌ \[LiveQA\] (\S+) failed: (.*)/))) {
