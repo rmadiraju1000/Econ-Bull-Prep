@@ -65,12 +65,39 @@ class LiveQA {
         this.partialTimer = null;
         this.lastRequestAt = 0;
         this.backoffUntil = 0;
-        this.speculativeHeard = null; // text an early answer was started from, for this utterance
-        this.earlyFailed = false; // the early answer for this utterance errored out
+        // Early-answer state is kept PER SPEAKER, so mic chatter can't reset the
+        // tracking for a question coming from the call/system audio.
+        this.early = { Me: { heard: null, failed: false }, Them: { heard: null, failed: false } };
+        this.recentThem = []; // [{ t, text }] system-audio text from the last few seconds
         this.deadModels = this.deadModels || new Set(); // models that returned 'not found' — skip them
         this.status = 'idle';
         this.statusDetail = '';
         if (!silent) this.publish();
+    }
+
+    rememberThem(text) {
+        const now = Date.now();
+        this.recentThem.push({ t: now, text });
+        this.recentThem = this.recentThem.filter(x => now - x.t < 15000).slice(-30);
+    }
+
+    /**
+     * When audio plays through the speakers, the mic hears it too and it shows up
+     * as "me". Treat a "me" line as an echo if most of its words were just heard
+     * from the system audio, or if system audio was playing at that moment.
+     */
+    isEcho(speaker, text) {
+        if (speaker !== 'Me') return false;
+        const now = Date.now();
+        const recent = this.recentThem.filter(x => now - x.t < 15000);
+        if (!recent.length) return false;
+        if (now - recent[recent.length - 1].t < 1200) return true; // the call/video is talking right now
+        const words = new Set(normalize(text).split(' ').filter(w => w.length > 2));
+        if (words.size < 2) return false;
+        const themWords = new Set(normalize(recent.map(x => x.text).join(' ')).split(' '));
+        let overlap = 0;
+        words.forEach(w => themWords.has(w) && overlap++);
+        return overlap / words.size >= 0.5;
     }
 
     /** Does the END of this text look like a question is being asked? */
@@ -86,8 +113,11 @@ class LiveQA {
 
     /** Live (partial) transcript while someone is talking. */
     onPartial(speaker, text) {
+        if (speaker === 'Them') this.rememberThem(text);
+        const st = this.early[speaker] || this.early.Them;
         if (this.partialTimer) clearTimeout(this.partialTimer);
-        if (this.speculativeHeard) return; // already started early for this utterance
+        if (st.heard) return; // already started early for this utterance
+        if (this.isEcho(speaker, text)) return;
         if (!this.looksLikeQuestion(text) || text.trim().split(/\s+/).length < 5) return;
 
         this.partialTimer = setTimeout(() => {
@@ -96,21 +126,26 @@ class LiveQA {
                 console.log(`[LiveQA] Skipping early answer: ${skip}`);
                 return; // the final turn will still be answered
             }
-            this.speculativeHeard = text.trim();
-            this.earlyFailed = false;
-            console.log(`⚡ [LiveQA] Early answer from partial: "${lastWords(text, 20)}"`);
-            this.request({ speculative: true, heard: text.trim() });
+            st.heard = text.trim();
+            st.failed = false;
+            console.log(`⚡ [LiveQA] Early answer from partial (${speaker}): "${lastWords(text, 20)}"`);
+            this.request({ speculative: true, heard: text.trim(), speaker });
         }, SPECULATIVE_PAUSE_MS);
     }
 
     /** A finished turn. `history` is the conversation lines so far. */
     onFinalTurn(speaker, text, history) {
-        if (this.partialTimer) clearTimeout(this.partialTimer);
         this.history = history;
-        const heardEarly = this.earlyFailed ? null : this.speculativeHeard; // a failed early answer doesn't count
-        this.speculativeHeard = null; // next utterance may start early again
-        this.earlyFailed = false;
+        if (speaker === 'Them') this.rememberThem(text);
+        const st = this.early[speaker] || this.early.Them;
+        const heardEarly = st.failed ? null : st.heard; // a failed early answer doesn't count
+        st.heard = null; // this speaker's next utterance may start early again
+        st.failed = false;
 
+        if (this.isEcho(speaker, text)) {
+            console.log(`[LiveQA] Ignoring mic echo of the call audio: "${lastWords(text, 12)}"`);
+            return;
+        }
         if (!this.looksLikeQuestion(text)) return;
 
         // Already answering from the partial transcript and the final text only
@@ -123,7 +158,7 @@ class LiveQA {
                 return;
             }
         }
-        this.request({ speculative: false });
+        this.request({ speculative: false, speaker });
     }
 
     setHistory(history) {
@@ -162,7 +197,7 @@ class LiveQA {
         return list;
     }
 
-    async request({ speculative, heard = '' }) {
+    async request({ speculative, heard = '', speaker = 'Them' }) {
         const now = Date.now();
         const blocked = this.blockedReason(speculative);
         if (blocked) {
@@ -265,7 +300,7 @@ class LiveQA {
         }
 
         if (seq !== this.requestSeq) return;
-        if (speculative) this.earlyFailed = true; // let the finished question be answered instead
+        if (speculative && this.early[speaker]) this.early[speaker].failed = true; // answer the finished question instead
         const msg = lastError?.message || 'Unknown error';
         if (/\b429\b|rate.?limit|quota|RESOURCE_EXHAUSTED/i.test(msg) && models.length <= 1) {
             this.backoffUntil = Date.now() + RATE_LIMIT_BACKOFF_MS;
