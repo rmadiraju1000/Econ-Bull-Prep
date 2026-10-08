@@ -35,7 +35,8 @@ const clock = l => {
 
 const firstWords = []; // { ms, model, route, early }
 const done = [];
-const leadEvents = []; // { t, ms }
+let skipNextAnswer = false;
+let leadEvents = []; // { t, ms }
 const answerEvents = []; // { t, q, a, time }
 const failures = {};
 const ratings = []; // { verdict, model, q, a }
@@ -65,7 +66,10 @@ for (const l of lines) {
     else if (/Ignoring mic echo/.test(l)) c.echoIgnored++;
     else if (/Ignoring call-audio-only mode/.test(l)) c.micIgnored++;
     else if (/\[LiveQA\] Skipping/.test(l)) c.rateGuard++;
-    else if (/\[LiveQA\] Already answered/.test(l)) c.alreadyAnswered++;
+    else if (/\[LiveQA\] Already answered/.test(l)) {
+        c.alreadyAnswered++;
+        skipNextAnswer = true; // the next 📝 line is the suppressed repeat, not a new card
+    }
     else if ((m = l.match(/🔍 \[LiveQA\] Double-check (OK|CORRECTED) in (\d+)ms(.*)/))) {
         verify[m[1] === 'OK' ? 'ok' : 'corrected']++;
         verify.ms.push(+m[2]);
@@ -92,8 +96,11 @@ for (const l of lines) {
         const key = `${m[1]}: ${reason}`;
         failures[key] = (failures[key] || 0) + 1;
     } else if ((m = l.match(/📝 \[LiveQA\] (?:\(#(\d+)\) )?Q: (.*?) \| A: (.*?) \|/))) {
-        if (m[2] === 'NONE') c.none++;
-        else if (m[2] === 'SAME') c.same++;
+        const wasSkipped = skipNextAnswer;
+        skipNextAnswer = false;
+        if (wasSkipped) leadEvents = leadEvents.filter(e => e.seq !== m[1]);
+        else if (m[2] === 'NONE') c.none++;
+        else if (m[2] === 'SAME' || (!m[2] && /Q: SAME/.test(l))) c.same++;
         else {
             c.answered++;
             answerEvents.push({ t: ts(l), time: clock(l), seq: m[1], q: m[2], a: m[3] });

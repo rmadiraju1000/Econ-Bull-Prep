@@ -752,7 +752,7 @@ class LiveQA {
         const lines = (text || '').split('\n');
         const qLineDone = final || /^\s*Q\s*[:：][^\n]*\n/i.test(text || '');
         for (const raw of lines) {
-            const line = raw.replace(/\*\*/g, '').trim();
+            const line = raw.replace(/\*\*/g, '').replace(/^\s*[-*•]\s*(?=[QA]\s*[:：])/i, '').trim(); // "- Q: SAME"
             if (!line) continue;
             const q = line.match(/^Q\s*[:：]\s*(.*)$/i);
             const a = line.match(/^A\s*[:：]\s*(.*)$/i);
