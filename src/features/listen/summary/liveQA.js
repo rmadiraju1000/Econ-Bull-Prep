@@ -63,6 +63,9 @@ const VERIFY_PROMPT = [
 // Broad check for a finished sentence (used for finished turns).
 const QUESTION_RE =
     /\b(what|why|how|where|who|whom|whose|which|explain|describe|define|tell (me|us)|walk (me|us) through|compare|contrast|calculate|compute|give (me|us)|can you|could you|would you|do you|did you|have you|is it|is there|are there|what's|should|name (the|this|a)|identify|true or false|known as|referred to as|is called|also called|term for|this (economist|term|concept|curve|law|theory|policy|type|principle|measure|tax|market|index|agency|act))\b/i;
+// Quiz commands that are questions without a question word: "Name two reasons…", "List three…".
+const IMPERATIVE_RE =
+    /(?:^|[.?!:]\s+|\b(?:question|number)\s+\w+[.,:]?\s+)(name|list|identify|give(?!\s+(?:me|us|it|him|her|them)\b)|state|explain|describe|define|calculate|compute|determine|find|predict|draw|graph)\b[^.?!]{10,}/i;
 // Stricter check for EARLY answers from the live transcript.
 const STRONG_Q_RE =
     /\b(what|which|who|whom|whose|why|how|name (the|this|a)|identify|explain|describe|define|calculate|compute|true or false|this (economist|term|concept|curve|law|theory|policy|type|principle|measure|tax|market|index|agency|act))\b/i;
@@ -93,7 +96,7 @@ function wordCount(t) {
  * speaker kept talking ("…what law? 20 seconds."). Looks at the last few sentences.
  * Returns { question, context } or null.
  */
-const TRAILING_TIMER_RE = /\s+((?:it'?s\s+)?(?:\d+|five|ten|fifteen|twenty|thirty|forty|sixty)\s+seconds?)\W*$/i;
+const TRAILING_TIMER_RE = /\s*((?:it'?s\s+)?(?:\d+|five|ten|fifteen|twenty|thirty|forty|sixty)\s+seconds?)\W*$/i;
 function completedQuestion(text) {
     // "…is also known as 20 seconds" (no punctuation): split the timer off as its own sentence.
     text = (text || '').replace(TRAILING_TIMER_RE, (m, t, off, all) => (/[.?!]$/.test(all.slice(0, off)) ? m : `. ${t}.`));
@@ -105,10 +108,19 @@ function completedQuestion(text) {
         if (!finished || TIMER_RE.test(s)) continue;
         const words = wordCount(s);
         const timerAfter = TIMER_RE.test(next);
-        const isQuestion =
+        let isQuestion =
             (s.endsWith('?') && words >= 4 && (STRONG_Q_RE.test(s) || words >= 7)) ||
+            (/[.!]$/.test(s) && words >= 5 && IMPERATIVE_RE.test(s)) ||
             (FILL_IN_END_RE.test(s) && words >= 5) ||
             (timerAfter && words >= 5);
+        if (!isQuestion && timerAfter && words < 5 && i > 0) {
+            // "Suppose tuna and peanut butter are substitutes. If there's an… 20 seconds."
+            // (fast speech / transcriber dropped words): use the last two sentences.
+            const merged = `${sentences[i - 1]} ${s}`;
+            if (wordCount(merged) >= 6 && !TIMER_RE.test(sentences[i - 1])) {
+                return { question: merged, context: sentences.slice(Math.max(0, i - 4), i + 1).join(' ') };
+            }
+        }
         if (isQuestion) {
             return { question: s, context: sentences.slice(Math.max(0, i - 3), i + 1).join(' ') };
         }
@@ -224,7 +236,7 @@ class LiveQA {
         const t = (text || '').trim();
         if (t.split(/\s+/).length < 3) return false;
         const tail = lastWords(t, 25);
-        if (QUESTION_RE.test(tail)) return true;
+        if (QUESTION_RE.test(tail) || IMPERATIVE_RE.test(tail)) return true;
         if (completedQuestion(t)) return true;
         return tail.includes('?') && t.split(/\s+/).length >= 6;
     }
@@ -792,3 +804,4 @@ class LiveQA {
 }
 
 module.exports = { LiveQA };
+module.exports.completedQuestion = completedQuestion;

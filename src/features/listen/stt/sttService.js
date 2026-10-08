@@ -206,12 +206,17 @@ class SttService {
         const interim = rawInterim ? newPart(rawInterim) : '';
         const final = rawFinal ? newPart(rawFinal) : '';
 
+        this.geminiInterim = this.geminiInterim || { Me: '', Them: '' };
         if (rawFinal) {
             // Remember the longest cumulative text for this turn.
             this.geminiSegment[speaker] = rawFinal;
             if (final) this[bufferKey] = join(this[bufferKey], final);
-            this[interimKey] = '';
+            // Keep live words the final hasn't covered yet (fast speech can outrun the
+            // finals; dropping them lost the middle of questions).
+            const ahead = stripLeadingWords(this.geminiInterim[speaker], rawFinal);
+            this[interimKey] = ahead || '';
         } else if (rawInterim) {
+            this.geminiInterim[speaker] = rawInterim;
             this[interimKey] = interim;
         }
 
@@ -232,6 +237,7 @@ class SttService {
 
         if (content.turnComplete) {
             this.geminiSegment[speaker] = ''; // next turn starts fresh
+            this.geminiInterim[speaker] = '';
             if (this[bufferKey] || this[interimKey]) {
                 if (this[timerKey]) clearTimeout(this[timerKey]);
                 flush();
