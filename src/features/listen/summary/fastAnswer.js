@@ -39,13 +39,18 @@ async function* readSSE(response, signal) {
     }
 }
 
-async function streamGemini({ apiKey, model, system, user, temperature, maxTokens, signal, onDelta }) {
+async function streamGemini({ apiKey, model, system, user, imageBase64, temperature, maxTokens, signal, onDelta }) {
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse`;
 
     for (let i = geminiVariantIndex; i < GEMINI_THINKING_VARIANTS.length; i++) {
         const body = {
             systemInstruction: { parts: [{ text: system }] },
-            contents: [{ role: 'user', parts: [{ text: user }] }],
+            contents: [
+                {
+                    role: 'user',
+                    parts: imageBase64 ? [{ inline_data: { mime_type: 'image/jpeg', data: imageBase64 } }, { text: user }] : [{ text: user }],
+                },
+            ],
             generationConfig: { temperature, maxOutputTokens: maxTokens, ...GEMINI_THINKING_VARIANTS[i] },
         };
         const res = await fetch(url, {
@@ -84,7 +89,7 @@ async function streamGemini({ apiKey, model, system, user, temperature, maxToken
     throw new Error('Gemini request failed');
 }
 
-async function streamOpenAIStyle({ provider, apiKey, model, system, user, temperature, maxTokens, reasoningEffort, signal, onDelta }) {
+async function streamOpenAIStyle({ provider, apiKey, model, system, user, imageBase64, temperature, maxTokens, reasoningEffort, signal, onDelta }) {
     const llm = createStreamingLLM(provider, {
         apiKey,
         model,
@@ -97,7 +102,15 @@ async function streamOpenAIStyle({ provider, apiKey, model, system, user, temper
     const response = await llm.streamChat(
         [
             { role: 'system', content: system },
-            { role: 'user', content: user },
+            imageBase64
+                ? {
+                      role: 'user',
+                      content: [
+                          { type: 'text', text: user },
+                          { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${imageBase64}` } },
+                      ],
+                  }
+                : { role: 'user', content: user },
         ],
         signal
     );
@@ -119,11 +132,11 @@ async function streamOpenAIStyle({ provider, apiKey, model, system, user, temper
  * Streams an answer. Calls onDelta(fullTextSoFar) as tokens arrive.
  * Resolves with the complete text. Abort with the provided signal.
  */
-async function streamAnswer({ provider, apiKey, model, system, user, temperature = 0.3, maxTokens = 300, reasoningEffort, signal, onDelta }) {
+async function streamAnswer({ provider, apiKey, model, system, user, imageBase64, temperature = 0.3, maxTokens = 300, reasoningEffort, signal, onDelta }) {
     if (provider === 'gemini') {
-        return streamGemini({ apiKey, model, system, user, temperature, maxTokens, signal, onDelta });
+        return streamGemini({ apiKey, model, system, user, imageBase64, temperature, maxTokens, signal, onDelta });
     }
-    return streamOpenAIStyle({ provider, apiKey, model, system, user, temperature, maxTokens, reasoningEffort, signal, onDelta });
+    return streamOpenAIStyle({ provider, apiKey, model, system, user, imageBase64, temperature, maxTokens, reasoningEffort, signal, onDelta });
 }
 
 module.exports = { streamAnswer };

@@ -22,6 +22,8 @@ const util = require('util');
 const execFile = util.promisify(require('child_process').execFile);
 const { desktopCapturer } = require('electron');
 const modelStateService = require('../common/services/modelStateService');
+const { streamAnswer } = require('../listen/summary/fastAnswer');
+const groqProvider = require('../common/ai/providers/groq');
 
 // Try to load sharp, but don't fail if it's not available
 let sharp;
@@ -34,11 +36,41 @@ try {
     sharp = null;
 }
 let lastScreenshot = null;
+let pendingScreenshot = null; // { promise, startedAt }
+
+/** Start grabbing the screen now (e.g. when the Ask box opens) so it's ready when you hit Enter. */
+function prefetchScreenshot() {
+    const startedAt = Date.now();
+    const promise = captureScreenshot().catch(e => ({ success: false, error: e.message }));
+    pendingScreenshot = { promise, startedAt };
+    return promise;
+}
+
+/** Use a screenshot taken in the last 20 s if there is one, otherwise take a fresh one. */
+async function getScreenshotFast() {
+    if (pendingScreenshot && Date.now() - pendingScreenshot.startedAt < 20000) {
+        const r = await pendingScreenshot.promise;
+        pendingScreenshot = null;
+        if (r?.success) return { ...r, prefetched: true };
+    }
+    pendingScreenshot = null;
+    return captureScreenshot();
+}
+
+const ASK_SYSTEM_PROMPT = [
+    'You are a fast study helper. You see the user\'s screen (screenshot) and recent call/video transcript.',
+    'Answer the question on the screen or the user\'s request IMMEDIATELY.',
+    'Format: first line = the answer in bold (a few words or one sentence). Then at most 3 short bullets with the key reasoning or steps.',
+    'For multiple choice, give the letter and the option text. For math, show the key steps briefly and the final number.',
+    'Economics: get directions right (which curve shifts, left/right), use the correct term. No preamble, no restating the question, under 120 words.',
+].join('\n');
+const ASK_FIRST_TOKEN_TIMEOUT_MS = 6000;
+const ASK_HEDGE_AFTER_MS = 2000; // start a backup model if the first one hasn't started answering yet
 
 async function captureScreenshot(options = {}) {
     if (process.platform === 'darwin') {
         try {
-            const tempPath = path.join(os.tmpdir(), `screenshot-${Date.now()}.jpg`);
+            const tempPath = path.join(os.tmpdir(), `screenshot-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.jpg`);
 
             await execFile('screencapture', ['-x', '-t', 'jpg', tempPath]);
 
@@ -49,8 +81,9 @@ async function captureScreenshot(options = {}) {
                 try {
                     // Try using sharp for optimal image processing
                     const resizedBuffer = await sharp(imageBuffer)
-                        .resize({ height: 384 })
-                        .jpeg({ quality: 80 })
+                        // 384px tall was too small to read questions on screen; 1280 wide keeps text legible.
+                        .resize({ width: 1280, height: 1280, fit: 'inside', withoutEnlargement: true })
+                        .jpeg({ quality: 72 })
                         .toBuffer();
 
                     const base64 = resizedBuffer.toString('base64');
@@ -148,6 +181,7 @@ class AskService {
         const askWindow = getWindowPool()?.get('ask');
 
         let shouldSendScreenOnly = false;
+        if (!(askWindow && askWindow.isVisible())) prefetchScreenshot(); // grab the screen while you type
         if (inputScreenOnly && this.state.showTextInput && askWindow && askWindow.isVisible()) {
             shouldSendScreenOnly = true;
             await this.sendMessage('', []);
@@ -239,104 +273,34 @@ class AskService {
         try {
             console.log(`[AskService] 🤖 Processing message: ${userPrompt.substring(0, 50)}...`);
 
-            sessionId = await sessionRepository.getOrCreateActive('ask');
-            await askRepository.addAiMessage({ sessionId, role: 'user', content: userPrompt.trim() });
-            console.log(`[AskService] DB: Saved user prompt to session ${sessionId}`);
-            
-            const modelInfo = await modelStateService.getCurrentModelInfo('llm');
-            if (!modelInfo || !modelInfo.apiKey) {
-                throw new Error('AI model or API key not configured.');
-            }
-            console.log(`[AskService] Using model: ${modelInfo.model} for provider: ${modelInfo.provider}`);
+            const t0 = Date.now();
+            // Screenshot (usually already taken when the Ask box opened) and model list in parallel.
+            const [shot, models] = await Promise.all([getScreenshotFast(), this._askModels()]);
+            const screenshotBase64 = shot?.success ? shot.base64 : null;
+            console.log(`⏱ [AskService] Screenshot ready in ${Date.now() - t0}ms${shot?.prefetched ? ' (taken when Ask opened)' : ''}${shot?.width ? ` ${shot.width}x${shot.height}` : ''}`);
+            if (!models.length) throw new Error('AI model or API key not configured.');
 
-            const screenshotResult = await captureScreenshot({ quality: 'medium' });
-            const screenshotBase64 = screenshotResult.success ? screenshotResult.base64 : null;
+            // Save to the database in the background (it used to add ~0.5 s before answering).
+            const sessionPromise = sessionRepository
+                .getOrCreateActive('ask')
+                .then(id => askRepository.addAiMessage({ sessionId: id, role: 'user', content: userPrompt.trim() }).then(() => id))
+                .catch(e => console.error('[AskService] DB save failed:', e.message));
 
-            const conversationHistory = this._formatConversationForPrompt(conversationHistoryRaw);
+            const transcript = this._formatConversationForPrompt(conversationHistoryRaw);
+            const request = userPrompt.trim() || 'Answer the question shown on my screen.';
+            const user =
+                `Recent transcript (may be empty or messy):\n${transcript.slice(-2500)}\n\n` +
+                `User request: ${request}` +
+                (screenshotBase64 ? '' : '\n(No screenshot available.)');
 
-            const systemPrompt = getSystemPrompt('pickle_glass_analysis', conversationHistory, false);
+            const full = await this._raceModels({ models, user, imageBase64: screenshotBase64, signal, startedAt: t0 });
+            if (signal.aborted) return { success: false, error: 'aborted' };
 
-            const messages = [
-                { role: 'system', content: systemPrompt },
-                {
-                    role: 'user',
-                    content: [
-                        { type: 'text', text: `User Request: ${userPrompt.trim()}` },
-                    ],
-                },
-            ];
-
-            if (screenshotBase64) {
-                messages[1].content.push({
-                    type: 'image_url',
-                    image_url: { url: `data:image/jpeg;base64,${screenshotBase64}` },
-                });
-            }
-            
-            const streamingLLM = createStreamingLLM(modelInfo.provider, {
-                apiKey: modelInfo.apiKey,
-                model: modelInfo.model,
-                temperature: 0.7,
-                maxTokens: 2048,
-                usePortkey: modelInfo.provider === 'openai-glass',
-                portkeyVirtualKey: modelInfo.provider === 'openai-glass' ? modelInfo.apiKey : undefined,
-            });
-
-            try {
-                const response = await streamingLLM.streamChat(messages);
-                const askWin = getWindowPool()?.get('ask');
-
-                if (!askWin || askWin.isDestroyed()) {
-                    console.error("[AskService] Ask window is not available to send stream to.");
-                    response.body.getReader().cancel();
-                    return { success: false, error: 'Ask window is not available.' };
-                }
-
-                const reader = response.body.getReader();
-                signal.addEventListener('abort', () => {
-                    console.log(`[AskService] Aborting stream reader. Reason: ${signal.reason}`);
-                    reader.cancel(signal.reason).catch(() => { /* 이미 취소된 경우의 오류는 무시 */ });
-                });
-
-                await this._processStream(reader, askWin, sessionId, signal);
-                return { success: true };
-
-            } catch (multimodalError) {
-                // 멀티모달 요청이 실패했고 스크린샷이 포함되어 있다면 텍스트만으로 재시도
-                if (screenshotBase64 && this._isMultimodalError(multimodalError)) {
-                    console.log(`[AskService] Multimodal request failed, retrying with text-only: ${multimodalError.message}`);
-                    
-                    // 텍스트만으로 메시지 재구성
-                    const textOnlyMessages = [
-                        { role: 'system', content: systemPrompt },
-                        {
-                            role: 'user',
-                            content: `User Request: ${userPrompt.trim()}`
-                        }
-                    ];
-
-                    const fallbackResponse = await streamingLLM.streamChat(textOnlyMessages);
-                    const askWin = getWindowPool()?.get('ask');
-
-                    if (!askWin || askWin.isDestroyed()) {
-                        console.error("[AskService] Ask window is not available for fallback response.");
-                        fallbackResponse.body.getReader().cancel();
-                        return { success: false, error: 'Ask window is not available.' };
-                    }
-
-                    const fallbackReader = fallbackResponse.body.getReader();
-                    signal.addEventListener('abort', () => {
-                        console.log(`[AskService] Aborting fallback stream reader. Reason: ${signal.reason}`);
-                        fallbackReader.cancel(signal.reason).catch(() => {});
-                    });
-
-                    await this._processStream(fallbackReader, askWin, sessionId, signal);
-                    return { success: true };
-                } else {
-                    // 다른 종류의 에러이거나 스크린샷이 없었다면 그대로 throw
-                    throw multimodalError;
-                }
-            }
+            this.state = { ...this.state, isLoading: false, isStreaming: false, currentResponse: full };
+            this._broadcastState();
+            console.log(`⚡ [AskService] Answer finished in ${Date.now() - t0}ms`);
+            sessionPromise.then(id => id && full && askRepository.addAiMessage({ sessionId: id, role: 'assistant', content: full }).catch(() => {}));
+            return { success: true };
 
         } catch (error) {
             console.error('[AskService] Error during message processing:', error);
@@ -367,6 +331,102 @@ class AskService {
      * @returns {Promise<void>}
      * @private
      */
+    /** Vision-capable models to try, fastest first. */
+    async _askModels() {
+        const list = [];
+        const add = (provider, apiKey, model) => {
+            if (apiKey && model && !list.some(m => m.provider === provider && m.model === model)) list.push({ provider, apiKey, model });
+        };
+        const keys = (await modelStateService.getAllApiKeys().catch(() => ({}))) || {};
+        const selected = await modelStateService.getCurrentModelInfo('llm').catch(() => null);
+        if (keys.groq) {
+            try {
+                const ids = await groqProvider.listModels(keys.groq);
+                ids.filter(id => groqProvider.VISION_RE.test(id)).forEach(id => add('groq', keys.groq, id));
+            } catch (_) {}
+        }
+        if (keys.gemini) ['gemini-3.5-flash-lite', 'gemini-3.8-flash'].forEach(m => add('gemini', keys.gemini, m));
+        if (selected?.apiKey && selected.provider !== 'groq') add(selected.provider, selected.apiKey, selected.model);
+        return list;
+    }
+
+    /**
+     * Stream from the first model; if it errors (503/429) or hasn't started within
+     * ASK_HEDGE_AFTER_MS, start the next one too. The first to produce text wins.
+     */
+    _raceModels({ models, user, imageBase64, signal, startedAt }) {
+        return new Promise((resolve, reject) => {
+            let winner = null;
+            let next = 0;
+            let running = 0;
+            let lastErr = null;
+            const controllers = [];
+            const hedgeTimers = [];
+            const cleanup = () => hedgeTimers.forEach(clearTimeout);
+            signal.addEventListener('abort', () => controllers.forEach(c => c.abort()));
+
+            const launch = () => {
+                if (winner || next >= models.length || signal.aborted) return;
+                const m = models[next++];
+                const ctrl = new AbortController();
+                controllers.push(ctrl);
+                running++;
+                let started = false;
+                const tStart = Date.now();
+                const ttft = setTimeout(() => !started && ctrl.abort(), ASK_FIRST_TOKEN_TIMEOUT_MS);
+                hedgeTimers.push(setTimeout(() => !started && !winner && launch(), ASK_HEDGE_AFTER_MS));
+                streamAnswer({
+                    provider: m.provider,
+                    apiKey: m.apiKey,
+                    model: m.model,
+                    system: ASK_SYSTEM_PROMPT,
+                    user,
+                    imageBase64,
+                    temperature: 0.2,
+                    maxTokens: 700,
+                    reasoningEffort: 'low',
+                    signal: ctrl.signal,
+                    onDelta: text => {
+                        if (winner && winner !== m) return;
+                        if (!winner) {
+                            winner = m;
+                            started = true;
+                            cleanup();
+                            controllers.forEach(c => c !== ctrl && c.abort()); // stop the slower model
+                            console.log(`⚡ [AskService] First words in ${Date.now() - startedAt}ms (${m.provider}/${m.model}, request took ${Date.now() - tStart}ms)`);
+                            this.state = { ...this.state, isLoading: false, isStreaming: true };
+                        }
+                        this.state.currentResponse = text;
+                        this._broadcastState();
+                    },
+                })
+                    .then(full => {
+                        clearTimeout(ttft);
+                        running--;
+                        if (winner === m) resolve(full);
+                        else if (!winner && !full.trim()) {
+                            lastErr = new Error(`${m.model} returned nothing`);
+                            launch();
+                        }
+                        if (!winner && running === 0 && next >= models.length) reject(lastErr || new Error('No answer'));
+                    })
+                    .catch(err => {
+                        clearTimeout(ttft);
+                        running--;
+                        if (winner === m) return resolve(this.state.currentResponse || '');
+                        if (signal.aborted) return resolve('');
+                        if (winner) return;
+                        const msg = err.name === 'AbortError' ? `no response within ${ASK_FIRST_TOKEN_TIMEOUT_MS}ms` : err.message;
+                        console.warn(`[AskService] ${m.provider}/${m.model} failed: ${String(msg).slice(0, 160)}`);
+                        lastErr = new Error(msg);
+                        launch(); // try the next model right away
+                        if (running === 0 && next >= models.length) reject(lastErr);
+                    });
+            };
+            launch();
+        });
+    }
+
     async _processStream(reader, askWin, sessionId, signal) {
         const decoder = new TextDecoder();
         let fullResponse = '';

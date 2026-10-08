@@ -67,6 +67,9 @@ async function liveModels(apiKey, preferred) {
 }
 
 // Groq's text models don't take images: keep only the text parts.
+// Groq models that accept images (kept as-is); everything else gets text only.
+const VISION_RE = /llama-4|vision|-vl\b|scout|maverick/i;
+
 function toTextMessages(messages) {
     return messages.map(m => {
         if (!Array.isArray(m.content)) return { role: m.role, content: m.content };
@@ -86,7 +89,7 @@ function extraParams(model, reasoningEffort) {
 function buildBody({ model, messages, temperature, maxTokens, stream, reasoningEffort }) {
     return JSON.stringify({
         model,
-        messages: toTextMessages(messages),
+        messages: VISION_RE.test(model) ? messages : toTextMessages(messages),
         temperature,
         max_tokens: maxTokens,
         stream,
@@ -133,3 +136,4 @@ function createStreamingLLM({ apiKey, model = 'llama-3.3-70b-versatile', tempera
 }
 
 module.exports = { GroqProvider, createLLM, createStreamingLLM, listModels, liveModels };
+module.exports.VISION_RE = VISION_RE;
