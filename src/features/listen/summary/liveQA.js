@@ -48,6 +48,7 @@ const SYSTEM_PROMPT = [
     '- Q: SAME   if the main question is one already answered (listed below), or the latest lines are only teams/people giving answers, scores, timers ("20 seconds", "boards up"), "repeat your answer", or chatter.',
     '- Q: NONE   if no real question is being asked yet (for example the question is still cut off and cannot be answered).',
     'Never treat someone\'s spoken answer as the correct answer; work it out yourself.',
+    'Questions often depend on SETUP given before them: a scenario, numbers, a table, or "use the following information for the next questions". Use all of that setup (also the "Setup given earlier" section) and put the key given numbers/facts in the Q: line.',
     'Quiz cues: a timer like "20 seconds" right after a sentence means that sentence was the question. A sentence ending in "is also known as" / "is called" / "is referred to as" is a fill-in-the-blank: answer with the term.',
     'Economics: use correct terms, get the DIRECTION of every effect right (which curve shifts, left or right; who bears a tax: the more inelastic side), and do any arithmetic step by step before answering. Keep the visible answer under 80 words.',
 ].join('\n');
@@ -79,6 +80,13 @@ const HARD_RE =
 function normalize(t) {
     return (t || '').toLowerCase().replace(/[^a-z0-9 ]/g, '').replace(/\s+/g, ' ').trim();
 }
+function lastChars(text, n) {
+    const t = (text || '').trim();
+    return t.length <= n ? t : '…' + t.slice(-n).replace(/^\S*\s/, '');
+}
+// Setup that later questions refer back to.
+const SETUP_RE =
+    /\b(use the following|following (information|data|table|graph|scenario)|for (the )?(next|following) (two|three|four|2|3|4) questions|questions? \w+ (and|through|to) \w+ (refer|are based)|refer to the|based on the (table|graph|information|data)|suppose|assume|given that|consider (a|an|the)|table (shows|below)|the graph)\b/i;
 function lastWords(text, n) {
     return (text || '').trim().split(/\s+/).slice(-n).join(' ');
 }
@@ -172,6 +180,7 @@ class LiveQA {
         if (this.abort) this.abort.abort();
         Object.values(this.partialTimers || {}).forEach(t => clearTimeout(t));
         this.cards = []; // newest first
+        this.setups = [];
         this.nextId = 1;
         this.requestSeq = 0;
         this.abort = null;
@@ -292,7 +301,9 @@ class LiveQA {
             this.pendingQ = { ...(this.pendingQ || {}), [speaker]: cq.question };
             this.partialTimers[speaker] = setTimeout(() => {
                 this.pendingQ[speaker] = null;
-                this.fireEarly(speaker, cq.context, cq.question, true);
+                // Send the WHOLE live turn, not just the question sentence: the setup
+                // ("Suppose GDP is 20, consumption is 16…") often comes several sentences before.
+                this.fireEarly(speaker, lastChars(text, 2500), cq.question, true);
             }, QUICK_PAUSE_MS);
             return;
         }
@@ -323,6 +334,9 @@ class LiveQA {
 
     onFinalTurn(speaker, text, history) {
         this.history = history;
+        if (speaker !== 'Me' && SETUP_RE.test(text) && wordCount(text) >= 8) {
+            this.setups = [...(this.setups || []), { text: text.trim(), at: Date.now() }].slice(-3);
+        }
         if (speaker === 'Them') this.rememberThem(text);
         const st = this.early[speaker] || (this.early[speaker] = {});
         clearTimeout(this.partialTimers[speaker]);
@@ -492,9 +506,23 @@ class LiveQA {
             .filter(c => !c.draft && Date.now() - c.updatedAt < CARD_MEMORY_MS)
             .slice(0, 6)
             .map((c, i) => `${i + 1}. ${c.question}`);
-        const recent = (this.history || []).slice(-10).join('\n');
+        // Recent conversation: up to 16 turns / ~3000 characters, newest kept.
+        const hist = this.history || [];
+        let recentTurns = [];
+        let size = 0;
+        for (let i = hist.length - 1; i >= 0 && recentTurns.length < 16; i--) {
+            size += hist[i].length;
+            if (size > 3000 && recentTurns.length >= 4) break;
+            recentTurns.unshift(hist[i]);
+        }
+        const recent = recentTurns.join('\n');
+        // Setup that has already scrolled out of the recent window (kept ~4 min).
+        const setups = (this.setups || [])
+            .filter(x => Date.now() - x.at < 4 * 60 * 1000 && !recent.includes(x.text.slice(0, 60)))
+            .map(x => x.text);
         const user =
             `Already answered (do not answer these again, reply Q: SAME):\n${answered.length ? answered.join('\n') : '(none yet)'}\n\n` +
+            (setups.length ? `Setup given earlier (later questions may refer to it):\n${setups.join('\n')}\n\n` : '') +
             `Conversation so far (most recent last):\n${recent}` +
             (speculative && heard ? `\n(still speaking, live transcript): ${heard}` : '');
 
