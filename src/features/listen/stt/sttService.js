@@ -247,6 +247,14 @@ class SttService {
             throw new Error('AI model or API key is not configured.');
         }
         this.modelInfo = modelInfo;
+        this.sttClosing = false;
+        this.sttLanguage = language;
+        const gen = (this.sttGen = (this.sttGen || 0) + 1);
+        const onUnexpectedClose = (who, event) => {
+            console.log(`${who} STT session closed:`, event?.reason);
+            if (gen !== this.sttGen || this.sttClosing) return; // old session after hand-off, or user stopped
+            this.scheduleSttReconnect(`${who} session closed`);
+        };
         console.log(`[SttService] Initializing STT for ${modelInfo.provider} using model ${modelInfo.model}`);
 
         const handleMyMessage = message => {
@@ -475,7 +483,7 @@ class SttService {
             callbacks: {
                 onmessage: handleMyMessage,
                 onerror: error => console.error('My STT session error:', error.message),
-                onclose: event => console.log('My STT session closed:', event.reason),
+                onclose: event => onUnexpectedClose('My', event),
             },
         };
         
@@ -484,7 +492,7 @@ class SttService {
             callbacks: {
                 onmessage: handleTheirMessage,
                 onerror: error => console.error('Their STT session error:', error.message),
-                onclose: event => console.log('Their STT session closed:', event.reason),
+                onclose: event => onUnexpectedClose('Their', event),
             },
         };
         
@@ -548,6 +556,31 @@ class SttService {
      * Gracefully tears down then recreates the STT sessions. Should be invoked
      * on a timer to avoid provider-side hard timeouts.
      */
+    /** Reconnect transcription after an unexpected drop (network blip, idle timeout). */
+    scheduleSttReconnect(reason) {
+        if (this.sttReconnectTimer || this.sttClosing) return;
+        const attempt = (this.sttReconnectAttempts = (this.sttReconnectAttempts || 0) + 1);
+        const delay = Math.min(500 * attempt, 5000);
+        console.warn(`🔁 [SttService] Transcription dropped (${reason}); reconnecting in ${delay}ms (attempt ${attempt})`);
+        this.sendToRenderer('update-status', 'Reconnecting transcription…');
+        this.sttReconnectTimer = setTimeout(async () => {
+            this.sttReconnectTimer = null;
+            if (this.sttClosing) return;
+            const oldMy = this.mySttSession;
+            const oldTheir = this.theirSttSession;
+            try {
+                await this.initializeSttSessions(this.sttLanguage || 'en');
+                this.sttReconnectAttempts = 0;
+                console.log('✅ [SttService] Transcription reconnected');
+                this.sendToRenderer('update-status', 'Connected. Ready to listen.');
+                try { oldMy?.close?.(); oldTheir?.close?.(); } catch (_) {}
+            } catch (err) {
+                console.error('[SttService] Reconnect failed:', err.message);
+                this.scheduleSttReconnect('reconnect failed');
+            }
+        }, delay);
+    }
+
     async renewSessions(language = 'en') {
         if (!this.isSessionActive()) {
             console.warn('[SttService] renewSessions called but no active session.');
@@ -662,6 +695,7 @@ class SttService {
 
     async startMacOSAudioCapture() {
         if (process.platform !== 'darwin' || !this.theirSttSession) return false;
+        this.wantSystemAudio = true;
 
         await this.killExistingSystemAudioDump();
         console.log('Starting macOS audio capture for "Them"...');
@@ -674,9 +708,15 @@ class SttService {
 
         console.log('SystemAudioDump path:', systemAudioPath);
 
-        this.systemAudioProc = spawn(systemAudioPath, [], {
+        const proc = spawn(systemAudioPath, [], {
             stdio: ['ignore', 'pipe', 'pipe'],
         });
+        this.systemAudioProc = proc;
+        this.lastSystemAudioAt = Date.now();
+        const restart = why => {
+            if (proc !== this.systemAudioProc && this.systemAudioProc) return; // a newer capture is running
+            this.restartSystemAudio(why);
+        };
 
         if (!this.systemAudioProc.pid) {
             console.error('Failed to start SystemAudioDump');
@@ -705,7 +745,12 @@ class SttService {
             throw new Error('STT model info could not be retrieved.');
         }
 
-        this.systemAudioProc.stdout.on('data', async data => {
+        proc.stdout.on('data', async data => {
+            this.lastSystemAudioAt = Date.now();
+            if (this.systemAudioRestarts) {
+                console.log('✅ [SttService] Computer audio is flowing again');
+                this.systemAudioRestarts = 0;
+            }
             audioBuffer = Buffer.concat([audioBuffer, data]);
 
             while (audioBuffer.length >= CHUNK_SIZE) {
@@ -736,19 +781,33 @@ class SttService {
             }
         });
 
-        this.systemAudioProc.stderr.on('data', data => {
-            console.error('SystemAudioDump stderr:', data.toString());
+        proc.stderr.on('data', data => {
+            const msg = data.toString();
+            console.error('SystemAudioDump stderr:', msg);
+            // e.g. "Stream stopped with error … Failed to find any displays" (screen locked,
+            // display changed, remote control started). The process may linger without audio.
+            if (/stream stopped|failed to find|SCStreamError/i.test(msg)) restart('capture stream stopped');
         });
 
-        this.systemAudioProc.on('close', code => {
+        proc.on('close', code => {
             console.log('SystemAudioDump process closed with code:', code);
-            this.systemAudioProc = null;
+            if (proc === this.systemAudioProc) {
+                this.systemAudioProc = null;
+                restart(`process exited (${code})`);
+            }
         });
 
-        this.systemAudioProc.on('error', err => {
+        proc.on('error', err => {
             console.error('SystemAudioDump process error:', err);
-            this.systemAudioProc = null;
+            if (proc === this.systemAudioProc) this.systemAudioProc = null;
         });
+
+        // Watchdog: the capture normally sends audio (even silence) every 100 ms.
+        clearInterval(this.systemAudioWatchdog);
+        this.systemAudioWatchdog = setInterval(() => {
+            if (!this.wantSystemAudio) return clearInterval(this.systemAudioWatchdog);
+            if (Date.now() - this.lastSystemAudioAt > 5000) restart('no audio for 5 s');
+        }, 2000);
 
         return true;
     }
@@ -765,7 +824,39 @@ class SttService {
         return monoBuffer;
     }
 
+    /** Restart computer-audio capture after it stops on its own, retrying until it works. */
+    restartSystemAudio(why) {
+        if (!this.wantSystemAudio || this.systemAudioRestartTimer) return;
+        const n = (this.systemAudioRestarts = (this.systemAudioRestarts || 0) + 1);
+        const delay = Math.min(1000 * n, 5000);
+        console.warn(`🔁 [SttService] Computer audio capture stopped (${why}); restarting in ${delay}ms (attempt ${n})`);
+        this.sendToRenderer('update-status', 'Computer audio dropped – reconnecting…');
+        this.systemAudioRestartTimer = setTimeout(async () => {
+            this.systemAudioRestartTimer = null;
+            if (!this.wantSystemAudio) return;
+            this.lastSystemAudioAt = Date.now(); // give the restart time before the watchdog fires again
+            const old = this.systemAudioProc;
+            this.systemAudioProc = null;
+            try { old?.kill('SIGTERM'); } catch (_) {}
+            try {
+                if (!this.theirSttSession) throw new Error('transcription not connected yet');
+                const ok = await this.startMacOSAudioCapture();
+                if (!ok) throw new Error('could not start');
+                this.lastSystemAudioAt = Date.now();
+            } catch (err) {
+                console.error('[SttService] Audio restart failed:', err.message);
+                this.restartSystemAudio('restart failed');
+            }
+        }, delay);
+    }
+
     stopMacOSAudioCapture() {
+        this.wantSystemAudio = false;
+        clearInterval(this.systemAudioWatchdog);
+        if (this.systemAudioRestartTimer) {
+            clearTimeout(this.systemAudioRestartTimer);
+            this.systemAudioRestartTimer = null;
+        }
         if (this.systemAudioProc) {
             console.log('Stopping SystemAudioDump...');
             this.systemAudioProc.kill('SIGTERM');
@@ -778,6 +869,11 @@ class SttService {
     }
 
     async closeSessions() {
+        this.sttClosing = true;
+        if (this.sttReconnectTimer) {
+            clearTimeout(this.sttReconnectTimer);
+            this.sttReconnectTimer = null;
+        }
         this.stopMacOSAudioCapture();
 
         // Clear heartbeat / renewal timers
