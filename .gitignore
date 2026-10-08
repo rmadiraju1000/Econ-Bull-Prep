@@ -113,3 +113,4 @@ data/*.db-wal
 out/
 dist/
 build/ glass.log
+latency-history.csv

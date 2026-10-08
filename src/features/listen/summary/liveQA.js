@@ -69,6 +69,7 @@ class LiveQA {
         // tracking for a question coming from the call/system audio.
         this.early = { Me: { heard: null, failed: false }, Them: { heard: null, failed: false } };
         this.recentThem = []; // [{ t, text }] system-audio text from the last few seconds
+        this.timing = new Map(); // requestSeq -> { firstAt, endAt, logged } for answer-lead stats
         this.deadModels = this.deadModels || new Set(); // models that returned 'not found' — skip them
         this.status = 'idle';
         this.statusDetail = '';
@@ -100,6 +101,20 @@ class LiveQA {
         return overlap / words.size >= 0.5;
     }
 
+    /** Record when a question ended / when its answer first appeared; log the lead once both are known. */
+    markTiming(seq, field) {
+        if (!seq) return;
+        const t = this.timing.get(seq) || {};
+        if (t[field] == null) t[field] = Date.now();
+        this.timing.set(seq, t);
+        if (t.firstAt != null && t.endAt != null && !t.logged) {
+            t.logged = true;
+            const lead = t.firstAt - t.endAt;
+            console.log(`⏱ [LiveQA] Answer lead vs end of question: ${lead >= 0 ? '+' : ''}${lead}ms`);
+        }
+        if (this.timing.size > 50) this.timing.delete(this.timing.keys().next().value);
+    }
+
     /** Does the END of this text look like a question is being asked? */
     looksLikeQuestion(text) {
         const t = (text || '').trim();
@@ -128,6 +143,7 @@ class LiveQA {
             }
             st.heard = text.trim();
             st.failed = false;
+            st.seq = this.requestSeq + 1; // the request about to be sent
             console.log(`⚡ [LiveQA] Early answer from partial (${speaker}): "${lastWords(text, 20)}"`);
             this.request({ speculative: true, heard: text.trim(), speaker });
         }, SPECULATIVE_PAUSE_MS);
@@ -139,8 +155,10 @@ class LiveQA {
         if (speaker === 'Them') this.rememberThem(text);
         const st = this.early[speaker] || this.early.Them;
         const heardEarly = st.failed ? null : st.heard; // a failed early answer doesn't count
+        const earlySeq = st.seq;
         st.heard = null; // this speaker's next utterance may start early again
         st.failed = false;
+        st.seq = null;
 
         if (this.isEcho(speaker, text)) {
             console.log(`[LiveQA] Ignoring mic echo of the call audio: "${lastWords(text, 12)}"`);
@@ -155,9 +173,12 @@ class LiveQA {
             const b = normalize(text);
             if (b.startsWith(a.slice(0, Math.max(0, a.length - 5))) && b.length - a.length <= 40) {
                 console.log('[LiveQA] Final turn matches early answer, keeping it');
+                this.markTiming(earlySeq, 'endAt');
                 return;
             }
         }
+        this.markTiming(this.requestSeq + 1, 'endAt'); // question ended as this request starts
+        console.log(`▶ [LiveQA] Answering finished question (${speaker})`);
         this.request({ speculative: false, speaker });
     }
 
@@ -271,6 +292,7 @@ class LiveQA {
                         if (seq !== this.requestSeq) return;
                         if (!firstAt) {
                             firstAt = Date.now();
+                            this.markTiming(seq, 'firstAt');
                             console.log(`⚡ [LiveQA] First words in ${firstAt - startedAt}ms (${m.provider}/${m.model})`);
                         }
                         render(text, false);

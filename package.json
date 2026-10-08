@@ -17,7 +17,8 @@
         "build:renderer": "node build.js",
         "build:web": "cd pickleglass_web && npm run build && cd ..",
         "build:all": "npm run build:renderer && npm run build:web",
-        "watch:renderer": "node build.js --watch"
+        "watch:renderer": "node build.js --watch",
+        "stats": "node scripts/latency-stats.js"
     },
     "keywords": [
         "glass",
