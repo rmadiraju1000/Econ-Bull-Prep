@@ -13,6 +13,12 @@ const { streamAnswer } = require('./fastAnswer');
 const SPECULATIVE_PAUSE_MS = 450; // live text must be stable this long before an early answer
 const MIN_GAP_MS = 1500; // minimum time between two answer requests
 const RATE_LIMIT_BACKOFF_MS = 15000; // pause after a 429 from the provider
+const FIRST_TOKEN_TIMEOUT_MS = 3500; // if a model hasn't started answering by then, try the next one
+
+// Live answers prefer Groq (fastest, most reliable) whenever a Groq key is saved,
+// then fall back to the model selected in Settings, then a backup Gemini model.
+const GROQ_LIVE_MODEL = 'llama-3.3-70b-versatile';
+const GEMINI_BACKUP_MODELS = ['gemini-3.5-flash-lite', 'gemini-3.8-flash'];
 const MAX_CARDS = 25;
 
 const SYSTEM_PROMPT = [
@@ -31,7 +37,7 @@ const SYSTEM_PROMPT = [
 ].join('\n');
 
 const QUESTION_RE =
-    /\b(what|why|how|when|where|who|which|explain|describe|define|tell (me|us)|walk (me|us) through|compare|contrast|calculate|give (me|us)|can you|could you|would you|do you|did you|have you|is it|is there|are there|what's|should)\b/i;
+    /\b(what|why|how|when|where|who|which|explain|describe|define|tell (me|us)|walk (me|us) through|compare|contrast|calculate|give (me|us)|can you|could you|would you|do you|did you|have you|is it|is there|are there|what's|should|name (the|this|a)|identify|true or false|this (economist|term|concept|curve|law|theory|policy|type|principle|measure|tax|market|index|agency|act))\b/i;
 
 function normalize(t) {
     return (t || '').toLowerCase().replace(/[^a-z0-9 ]/g, '').replace(/\s+/g, ' ').trim();
@@ -59,6 +65,7 @@ class LiveQA {
         this.lastRequestAt = 0;
         this.backoffUntil = 0;
         this.speculativeHeard = null; // text an early answer was started from, for this utterance
+        this.earlyFailed = false; // the early answer for this utterance errored out
         this.status = 'idle';
         this.statusDetail = '';
         if (!silent) this.publish();
@@ -85,6 +92,7 @@ class LiveQA {
                 return; // the final turn will still be answered
             }
             this.speculativeHeard = text.trim();
+            this.earlyFailed = false;
             console.log(`⚡ [LiveQA] Early answer from partial: "${lastWords(text, 20)}"`);
             this.request({ speculative: true, heard: text.trim() });
         }, SPECULATIVE_PAUSE_MS);
@@ -94,8 +102,9 @@ class LiveQA {
     onFinalTurn(speaker, text, history) {
         if (this.partialTimer) clearTimeout(this.partialTimer);
         this.history = history;
-        const heardEarly = this.speculativeHeard;
+        const heardEarly = this.earlyFailed ? null : this.speculativeHeard; // a failed early answer doesn't count
         this.speculativeHeard = null; // next utterance may start early again
+        this.earlyFailed = false;
 
         if (!this.looksLikeQuestion(text)) return;
 
@@ -122,6 +131,26 @@ class LiveQA {
         if (now < this.backoffUntil) return 'rate-limit back-off';
         if (speculative && now - this.lastRequestAt < MIN_GAP_MS) return 'too soon after the last request';
         return '';
+    }
+
+    /** Models to try for live answers, fastest/most reliable first. */
+    async candidates() {
+        const list = [];
+        const add = (provider, apiKey, model) => {
+            if (provider && apiKey && model && !list.some(c => c.provider === provider && c.model === model)) {
+                list.push({ provider, apiKey, model });
+            }
+        };
+        let keys = {};
+        try {
+            keys = (await modelStateService.getAllApiKeys()) || {};
+        } catch (_) {}
+        const selected = await modelStateService.getCurrentModelInfo('llm').catch(() => null);
+
+        if (keys.groq) add('groq', keys.groq, selected?.provider === 'groq' ? selected.model : GROQ_LIVE_MODEL);
+        if (selected?.apiKey) add(selected.provider, selected.apiKey, selected.model);
+        if (keys.gemini) GEMINI_BACKUP_MODELS.forEach(m => add('gemini', keys.gemini, m));
+        return list;
     }
 
     async request({ speculative, heard = '' }) {
@@ -163,46 +192,72 @@ class LiveQA {
             }
         };
 
-        try {
-            const modelInfo = await modelStateService.getCurrentModelInfo('llm');
-            if (!modelInfo || !modelInfo.apiKey) throw new Error('AI model or API key is not configured.');
+        const recent = (this.history || []).slice(-10).join('\n');
+        const user = `Conversation so far (most recent last):\n${recent}${
+            speculative && heard ? `\n(still speaking, live transcript): ${heard}` : ''
+        }`;
 
-            const recent = (this.history || []).slice(-10).join('\n');
-            let firstAt = 0;
-            const full = await streamAnswer({
-                provider: modelInfo.provider,
-                apiKey: modelInfo.apiKey,
-                model: modelInfo.model,
-                system: SYSTEM_PROMPT,
-                user: `Conversation so far (most recent last):\n${recent}${
-                    speculative && heard ? `\n(still speaking, live transcript): ${heard}` : ''
-                }`,
-                temperature: 0.2,
-                maxTokens: 220,
-                signal: abort.signal,
-                onDelta: text => {
-                    if (seq !== this.requestSeq) return;
-                    if (!firstAt) {
-                        firstAt = Date.now();
-                        console.log(`⚡ [LiveQA] First words in ${firstAt - startedAt}ms (${modelInfo.provider}/${modelInfo.model})`);
-                    }
-                    render(text, false);
-                },
-            });
+        let lastError = null;
+        const models = await this.candidates();
+        if (!models.length) lastError = new Error('No AI model or API key is configured.');
+
+        for (const m of models) {
             if (seq !== this.requestSeq) return;
-            render(full, true);
-            console.log(`⚡ [LiveQA] Done in ${Date.now() - startedAt}ms`);
-            this.setStatus('idle');
-        } catch (error) {
-            if (error.name === 'AbortError' || seq !== this.requestSeq) return;
-            const msg = error.message || String(error);
-            console.error('❌ [LiveQA] Answer failed:', msg);
-            if (/\b429\b|rate.?limit|quota|RESOURCE_EXHAUSTED/i.test(msg)) {
-                this.backoffUntil = Date.now() + RATE_LIMIT_BACKOFF_MS;
-                this.setStatus('rate-limited');
-            } else {
-                this.setStatus('error', msg.slice(0, 160));
+            // Per-attempt controller: aborted by a newer question OR by the first-token timeout.
+            const attempt = new AbortController();
+            const onOuterAbort = () => attempt.abort();
+            abort.signal.addEventListener('abort', onOuterAbort);
+            let firstAt = 0;
+            const timer = setTimeout(() => {
+                if (!firstAt) attempt.abort();
+            }, FIRST_TOKEN_TIMEOUT_MS);
+
+            try {
+                const t0 = Date.now();
+                const full = await streamAnswer({
+                    provider: m.provider,
+                    apiKey: m.apiKey,
+                    model: m.model,
+                    system: SYSTEM_PROMPT,
+                    user,
+                    temperature: 0.2,
+                    maxTokens: 220,
+                    signal: attempt.signal,
+                    onDelta: text => {
+                        if (seq !== this.requestSeq) return;
+                        if (!firstAt) {
+                            firstAt = Date.now();
+                            console.log(`⚡ [LiveQA] First words in ${firstAt - startedAt}ms (${m.provider}/${m.model})`);
+                        }
+                        render(text, false);
+                    },
+                });
+                if (seq !== this.requestSeq) return;
+                if (!full.trim()) throw new Error('Empty response');
+                render(full, true);
+                console.log(`⚡ [LiveQA] Done in ${Date.now() - startedAt}ms (attempt took ${Date.now() - t0}ms)`);
+                this.setStatus('idle');
+                return;
+            } catch (error) {
+                if (abort.signal.aborted || seq !== this.requestSeq) return; // superseded by a newer question
+                const msg = error.name === 'AbortError' ? `no response within ${FIRST_TOKEN_TIMEOUT_MS}ms` : error.message || String(error);
+                console.error(`❌ [LiveQA] ${m.provider}/${m.model} failed: ${msg.slice(0, 200)}`);
+                lastError = new Error(msg);
+                if (firstAt) break; // it had started streaming; don't restart mid-answer
+            } finally {
+                clearTimeout(timer);
+                abort.signal.removeEventListener('abort', onOuterAbort);
             }
+        }
+
+        if (seq !== this.requestSeq) return;
+        if (speculative) this.earlyFailed = true; // let the finished question be answered instead
+        const msg = lastError?.message || 'Unknown error';
+        if (/\b429\b|rate.?limit|quota|RESOURCE_EXHAUSTED/i.test(msg) && models.length <= 1) {
+            this.backoffUntil = Date.now() + RATE_LIMIT_BACKOFF_MS;
+            this.setStatus('rate-limited');
+        } else {
+            this.setStatus('error', msg.slice(0, 160));
         }
     }
 

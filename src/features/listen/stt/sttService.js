@@ -7,6 +7,21 @@ const modelStateService = require('../../common/services/modelStateService');
 // Lower = faster live answers; too low can split one question into two.
 const COMPLETION_DEBOUNCE_MS = 1100;
 
+/**
+ * If `full` begins with the same words as `prefix` (ignoring case/punctuation),
+ * return the remaining words of `full`; otherwise return null.
+ */
+function stripLeadingWords(full, prefix) {
+    const norm = w => w.toLowerCase().replace(/[^a-z0-9']/g, '');
+    const fw = (full || '').trim().split(/\s+/).filter(Boolean);
+    const pw = (prefix || '').trim().split(/\s+/).filter(Boolean);
+    if (!pw.length || pw.length > fw.length) return null;
+    for (let i = 0; i < pw.length; i++) {
+        if (norm(fw[i]) !== norm(pw[i])) return null;
+    }
+    return fw.slice(pw.length).join(' ');
+}
+
 // ── New heartbeat / renewal constants ────────────────────────────────────────────
 // Interval to send low-cost keep-alive messages so the remote service does not
 // treat the connection as idle. One minute is safely below the typical 2-5 min
@@ -175,13 +190,28 @@ class SttService {
         const clean = t => (t && t.trim() && t.trim() !== '<noise>' ? t : '');
         const join = (a, b) => (!a ? b : !b ? a : /\s$/.test(a) || /^\s/.test(b) ? a + b : `${a} ${b}`);
 
-        const interim = clean(content.interimInputTranscription?.text);
-        const final = clean(content.inputTranscription?.text);
+        // transcribe-live repeats everything said so far in the current turn in
+        // each new final/interim message. Keep only the words we haven't seen,
+        // otherwise the same sentence piles up again and again.
+        this.geminiSegment = this.geminiSegment || { Me: '', Them: '' };
+        const seen = this.geminiSegment[speaker];
+        const newPart = text => {
+            if (!text) return '';
+            const rest = stripLeadingWords(text, seen);
+            return rest === null ? text : rest;
+        };
 
-        if (final) {
-            this[bufferKey] = join(this[bufferKey], final);
+        const rawInterim = clean(content.interimInputTranscription?.text);
+        const rawFinal = clean(content.inputTranscription?.text);
+        const interim = rawInterim ? newPart(rawInterim) : '';
+        const final = rawFinal ? newPart(rawFinal) : '';
+
+        if (rawFinal) {
+            // Remember the longest cumulative text for this turn.
+            this.geminiSegment[speaker] = rawFinal;
+            if (final) this[bufferKey] = join(this[bufferKey], final);
             this[interimKey] = '';
-        } else if (interim) {
+        } else if (rawInterim) {
             this[interimKey] = interim;
         }
 
@@ -200,9 +230,12 @@ class SttService {
             this[timerKey] = setTimeout(flush, COMPLETION_DEBOUNCE_MS);
         }
 
-        if (content.turnComplete && (this[bufferKey] || this[interimKey])) {
-            if (this[timerKey]) clearTimeout(this[timerKey]);
-            flush();
+        if (content.turnComplete) {
+            this.geminiSegment[speaker] = ''; // next turn starts fresh
+            if (this[bufferKey] || this[interimKey]) {
+                if (this[timerKey]) clearTimeout(this[timerKey]);
+                flush();
+            }
         }
     }
 
