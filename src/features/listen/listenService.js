@@ -102,11 +102,10 @@ class ListenService {
     async handleTranscriptionComplete(speaker, text) {
         console.log(`[ListenService] Transcription complete: ${speaker} - ${text}`);
         
-        // Save to database
-        await this.saveConversationTurn(speaker, text);
-        
-        // Add to summary service for analysis
+        // Hand the sentence to live answering FIRST (saves ~0.4 s per question),
+        // then save it to the database.
         this.summaryService.addConversationTurn(speaker, text);
+        await this.saveConversationTurn(speaker, text);
     }
 
     async saveConversationTurn(speaker, transcription) {

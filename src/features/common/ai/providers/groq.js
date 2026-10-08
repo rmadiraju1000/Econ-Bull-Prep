@@ -79,18 +79,18 @@ function toTextMessages(messages) {
 }
 
 // gpt-oss models reason before answering; keep that minimal and hidden for speed.
-function extraParams(model) {
-    return /gpt-oss/.test(model) ? { reasoning_effort: 'low', reasoning_format: 'hidden' } : {};
+function extraParams(model, reasoningEffort) {
+    return /gpt-oss/.test(model) ? { reasoning_effort: reasoningEffort || 'low', reasoning_format: 'hidden' } : {};
 }
 
-function buildBody({ model, messages, temperature, maxTokens, stream }) {
+function buildBody({ model, messages, temperature, maxTokens, stream, reasoningEffort }) {
     return JSON.stringify({
         model,
         messages: toTextMessages(messages),
         temperature,
         max_tokens: maxTokens,
         stream,
-        ...extraParams(model),
+        ...extraParams(model, reasoningEffort),
     });
 }
 
@@ -124,11 +124,11 @@ function createLLM({ apiKey, model = 'llama-3.3-70b-versatile', temperature = 0.
     };
 }
 
-function createStreamingLLM({ apiKey, model = 'llama-3.3-70b-versatile', temperature = 0.7, maxTokens = 2048 }) {
+function createStreamingLLM({ apiKey, model = 'llama-3.3-70b-versatile', temperature = 0.7, maxTokens = 2048, reasoningEffort }) {
     return {
         // Returns an OpenAI-style SSE Response (same shape the other providers return).
         streamChat: async (messages, signal) =>
-            groqFetch(apiKey, buildBody({ model, messages, temperature, maxTokens, stream: true }), signal),
+            groqFetch(apiKey, buildBody({ model, messages, temperature, maxTokens, stream: true, reasoningEffort }), signal),
     };
 }
 

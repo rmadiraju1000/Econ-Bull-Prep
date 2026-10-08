@@ -181,7 +181,9 @@ contextBridge.exposeInMainWorld('api', {
 
     // Live question answering (Answers tab)
     onQaUpdate: (callback) => ipcRenderer.on('qa-update', callback),
-    removeOnQaUpdate: (callback) => ipcRenderer.removeListener('qa-update', callback)
+    removeOnQaUpdate: (callback) => ipcRenderer.removeListener('qa-update', callback),
+    qaSetOptions: (opts) => ipcRenderer.invoke('qa:set-options', opts),
+    qaRate: (id, correct) => ipcRenderer.invoke('qa:rate', { id, correct })
   },
 
   // src/ui/listen/stt/SttView.js

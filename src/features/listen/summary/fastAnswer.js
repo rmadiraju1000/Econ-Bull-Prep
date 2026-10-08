@@ -84,12 +84,13 @@ async function streamGemini({ apiKey, model, system, user, temperature, maxToken
     throw new Error('Gemini request failed');
 }
 
-async function streamOpenAIStyle({ provider, apiKey, model, system, user, temperature, maxTokens, signal, onDelta }) {
+async function streamOpenAIStyle({ provider, apiKey, model, system, user, temperature, maxTokens, reasoningEffort, signal, onDelta }) {
     const llm = createStreamingLLM(provider, {
         apiKey,
         model,
         temperature,
         maxTokens,
+        reasoningEffort,
         usePortkey: provider === 'openai-glass',
         portkeyVirtualKey: provider === 'openai-glass' ? apiKey : undefined,
     });
@@ -118,11 +119,11 @@ async function streamOpenAIStyle({ provider, apiKey, model, system, user, temper
  * Streams an answer. Calls onDelta(fullTextSoFar) as tokens arrive.
  * Resolves with the complete text. Abort with the provided signal.
  */
-async function streamAnswer({ provider, apiKey, model, system, user, temperature = 0.3, maxTokens = 300, signal, onDelta }) {
+async function streamAnswer({ provider, apiKey, model, system, user, temperature = 0.3, maxTokens = 300, reasoningEffort, signal, onDelta }) {
     if (provider === 'gemini') {
         return streamGemini({ apiKey, model, system, user, temperature, maxTokens, signal, onDelta });
     }
-    return streamOpenAIStyle({ provider, apiKey, model, system, user, temperature, maxTokens, signal, onDelta });
+    return streamOpenAIStyle({ provider, apiKey, model, system, user, temperature, maxTokens, reasoningEffort, signal, onDelta });
 }
 
 module.exports = { streamAnswer };
