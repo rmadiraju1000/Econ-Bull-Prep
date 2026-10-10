@@ -376,6 +376,15 @@ class LiveQA {
                 return;
             }
         }
+        // Long talkers: don't re-ask about the same question every time they pause.
+        const key = lastQ ? lastQ.question : lastWords(text, 25);
+        const recent = this.lastFinalAsk;
+        const stillUseful = recent && (this.answeredSeqs?.has(recent.seq) || (recent.seq === this.requestSeq && this.status === 'thinking'));
+        if (recent && stillUseful && Date.now() - recent.at < 20000 && sameQuestion(recent.key, key)) {
+            console.log(`[LiveQA] Same question as ${Math.round((Date.now() - recent.at) / 1000)}s ago – not asking again`);
+            return;
+        }
+        this.lastFinalAsk = { key, at: Date.now(), seq: this.requestSeq + 1 };
         this.markTiming(this.requestSeq + 1, 'endAt');
         console.log(`▶ [LiveQA] Answering finished question (${speaker})`);
         this.request({ speculative: false, speaker, replaceCardId: earlyCardId });
@@ -512,7 +521,7 @@ class LiveQA {
         let size = 0;
         for (let i = hist.length - 1; i >= 0 && recentTurns.length < 16; i--) {
             size += hist[i].length;
-            if (size > 3000 && recentTurns.length >= 4) break;
+            if (size > 2400 && recentTurns.length >= 3) break;
             recentTurns.unshift(hist[i]);
         }
         const recent = recentTurns.join('\n');
@@ -584,7 +593,9 @@ class LiveQA {
         // Show the quick answer right away; the smart one confirms or corrects it.
         let smartRun = null;
         let smartInfo = null;
-        if (hard && models[0]?.provider === 'groq' && models[0].effort === 'medium') {
+        const groqStruggling = (this.slowEvents || []).filter(t => Date.now() - t < 60000).length >= 2;
+        if (groqStruggling) console.log('[LiveQA] Groq is slow right now – skipping the parallel 120B check');
+        if (hard && !groqStruggling && models[0]?.provider === 'groq' && models[0].effort === 'medium') {
             const fastIdx = models.findIndex((c, i) => i > 0 && c.provider === 'groq');
             if (fastIdx > 0) {
                 smartInfo = models[0];
@@ -649,6 +660,7 @@ class LiveQA {
                 const p = this.parse(full, true);
                 const tag = p.same ? 'SAME' : p.none ? 'NONE' : p.question;
                 console.log(`📝 [LiveQA] (#${seq}) Q: ${tag} | A: ${p.answer} | ${p.points.join(' / ')}`);
+                if (outcome === 'answered' || p.same) (this.answeredSeqs = this.answeredSeqs || new Set()).add(seq);
                 console.log(`⚡ [LiveQA] Done in ${Date.now() - startedAt}ms (attempt took ${Date.now() - t0}ms)`);
                 if (smartRun) {
                     fastDone = true;
@@ -673,6 +685,7 @@ class LiveQA {
                 console.error(`❌ [LiveQA] ${m.provider}/${m.model} failed: ${msg.slice(0, 200)}`);
                 if (/\b404\b|model_not_found|does not exist|not found/i.test(msg)) this.deadModels.add(`${m.provider}/${m.model}`);
                 if (/no response within|\b5\d\d\b|overload|unavailable|ECONN|ETIMEDOUT|fetch failed/i.test(msg)) downProviders.add(m.provider);
+                if (/no response within|\b429\b|rate.?limit/i.test(msg) && m.provider === 'groq') this.slowEvents = [...(this.slowEvents || []), Date.now()].slice(-5);
                 lastError = new Error(msg);
                 if (firstAt) break; // it had started streaming; don't restart mid-answer
             } finally {

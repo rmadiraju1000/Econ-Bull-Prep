@@ -11,6 +11,33 @@ const COMPLETION_DEBOUNCE_MS = 1100;
  * If `full` begins with the same words as `prefix` (ignoring case/punctuation),
  * return the remaining words of `full`; otherwise return null.
  */
+/**
+ * Words in `full` that come after `seen`, tolerating small revisions the
+ * transcriber makes to earlier words (punctuation, a re-heard word).
+ * Returns '' when nothing is new, or the whole text if it's unrelated.
+ */
+function newWordsAfter(full, seen) {
+    const exact = stripLeadingWords(full, seen);
+    if (exact !== null) return exact;
+    const norm = w => w.toLowerCase().replace(/[^a-z0-9']/g, '');
+    const fwRaw = (full || '').trim().split(/\s+/).filter(Boolean);
+    const fw = fwRaw.map(norm);
+    const pw = (seen || '').trim().split(/\s+/).filter(Boolean).map(norm);
+    if (!pw.length) return full;
+    // Anchor on the last few words we already have and continue after them.
+    for (let k = Math.min(6, pw.length); k >= 3; k--) {
+        const tail = pw.slice(-k).join(' ');
+        for (let i = fw.length - k; i >= 0; i--) {
+            if (fw.slice(i, i + k).join(' ') === tail) return fwRaw.slice(i + k).join(' ');
+        }
+    }
+    // Mostly the same words (a revised cumulative transcript): take what's beyond the old length.
+    const P = new Set(pw);
+    const overlap = fw.slice(0, pw.length).filter(w => P.has(w)).length / pw.length;
+    if (overlap >= 0.6) return fwRaw.slice(pw.length).join(' ');
+    return full;
+}
+
 function stripLeadingWords(full, prefix) {
     const norm = w => w.toLowerCase().replace(/[^a-z0-9']/g, '');
     const fw = (full || '').trim().split(/\s+/).filter(Boolean);
@@ -195,11 +222,7 @@ class SttService {
         // otherwise the same sentence piles up again and again.
         this.geminiSegment = this.geminiSegment || { Me: '', Them: '' };
         const seen = this.geminiSegment[speaker];
-        const newPart = text => {
-            if (!text) return '';
-            const rest = stripLeadingWords(text, seen);
-            return rest === null ? text : rest;
-        };
+        const newPart = text => (text ? newWordsAfter(text, seen) : '');
 
         const rawInterim = clean(content.interimInputTranscription?.text);
         const rawFinal = clean(content.inputTranscription?.text);
@@ -213,8 +236,8 @@ class SttService {
             if (final) this[bufferKey] = join(this[bufferKey], final);
             // Keep live words the final hasn't covered yet (fast speech can outrun the
             // finals; dropping them lost the middle of questions).
-            const ahead = stripLeadingWords(this.geminiInterim[speaker], rawFinal);
-            this[interimKey] = ahead || '';
+            const ahead = this.geminiInterim[speaker] ? newWordsAfter(this.geminiInterim[speaker], rawFinal) : '';
+            this[interimKey] = ahead && ahead !== this.geminiInterim[speaker] ? ahead : '';
         } else if (rawInterim) {
             this.geminiInterim[speaker] = rawInterim;
             this[interimKey] = interim;
@@ -924,4 +947,5 @@ class SttService {
     }
 }
 
-module.exports = SttService; 
+module.exports = SttService;
+module.exports.newWordsAfter = newWordsAfter;

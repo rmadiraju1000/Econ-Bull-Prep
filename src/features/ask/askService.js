@@ -24,6 +24,7 @@ const { desktopCapturer } = require('electron');
 const modelStateService = require('../common/services/modelStateService');
 const { streamAnswer } = require('../listen/summary/fastAnswer');
 const groqProvider = require('../common/ai/providers/groq');
+const { recognizeText } = require('./ocr');
 
 // Try to load sharp, but don't fail if it's not available
 let sharp;
@@ -75,7 +76,8 @@ async function captureScreenshot(options = {}) {
             await execFile('screencapture', ['-x', '-t', 'jpg', tempPath]);
 
             const imageBuffer = await fs.promises.readFile(tempPath);
-            await fs.promises.unlink(tempPath);
+            // Read the screen's text on-device in parallel, then delete the file.
+            const ocr = recognizeText(tempPath).finally(() => fs.promises.unlink(tempPath).catch(() => {}));
 
             if (sharp) {
                 try {
@@ -96,7 +98,7 @@ async function captureScreenshot(options = {}) {
                         timestamp: Date.now(),
                     };
 
-                    return { success: true, base64, width: metadata.width, height: metadata.height };
+                    return { success: true, base64, width: metadata.width, height: metadata.height, ocr };
                 } catch (sharpError) {
                     console.warn('Sharp module failed, falling back to basic image processing:', sharpError.message);
                 }
@@ -113,7 +115,7 @@ async function captureScreenshot(options = {}) {
                 timestamp: Date.now(),
             };
 
-            return { success: true, base64, width: null, height: null };
+            return { success: true, base64, width: null, height: null, ocr };
         } catch (error) {
             console.error('Failed to capture screenshot:', error);
             return { success: false, error: error.message };
@@ -275,10 +277,12 @@ class AskService {
 
             const t0 = Date.now();
             // Screenshot (usually already taken when the Ask box opened) and model list in parallel.
-            const [shot, models] = await Promise.all([getScreenshotFast(), this._askModels()]);
+            const [shot, imageModels, textModel] = await Promise.all([getScreenshotFast(), this._askModels(), this._textModel()]);
             const screenshotBase64 = shot?.success ? shot.base64 : null;
             console.log(`⏱ [AskService] Screenshot ready in ${Date.now() - t0}ms${shot?.prefetched ? ' (taken when Ask opened)' : ''}${shot?.width ? ` ${shot.width}x${shot.height}` : ''}`);
-            if (!models.length) throw new Error('AI model or API key not configured.');
+            // On-device text recognition (usually already done while you typed); don't wait more than 1.5 s for it.
+            const screenText = shot?.ocr ? await Promise.race([shot.ocr, new Promise(r => setTimeout(() => r(''), 1500))]) : '';
+            console.log(`⏱ [AskService] Screen text ready in ${Date.now() - t0}ms (${screenText.length} chars)`);
 
             // Save to the database in the background (it used to add ~0.5 s before answering).
             const sessionPromise = sessionRepository
@@ -292,6 +296,23 @@ class AskService {
                 `Recent transcript (may be empty or messy):\n${transcript.slice(-2500)}\n\n` +
                 `User request: ${request}` +
                 (screenshotBase64 ? '' : '\n(No screenshot available.)');
+
+            // Groq reads the recognized text (fastest); Gemini looks at the picture. Both start together.
+            const models = [];
+            if (textModel && screenText.length >= 15) {
+                models.push({
+                    ...textModel,
+                    noImage: true,
+                    user:
+                        `Recent transcript (may be empty or messy):\n${transcript.slice(-2000)}\n\n` +
+                        `Text on the user's screen (from OCR, top to bottom; layout may be lost):\n${screenText.slice(0, 6000)}\n\n` +
+                        `User request: ${request}`,
+                    launchWithNext: true,
+                });
+            }
+            if (screenshotBase64) models.push(...imageModels);
+            else if (textModel && !models.length) models.push({ ...textModel, noImage: true });
+            if (!models.length) throw new Error('AI model or API key not configured.');
 
             const full = await this._raceModels({ models, user, imageBase64: screenshotBase64, signal, startedAt: t0 });
             if (signal.aborted) return { success: false, error: 'aborted' };
@@ -331,6 +352,20 @@ class AskService {
      * @returns {Promise<void>}
      * @private
      */
+    /** Fast Groq text model for answering from the screen's recognized text. */
+    async _textModel() {
+        const keys = (await modelStateService.getAllApiKeys().catch(() => ({}))) || {};
+        if (!keys.groq) return null;
+        let ids = [];
+        try {
+            ids = await groqProvider.listModels(keys.groq);
+        } catch (_) {
+            ids = ['openai/gpt-oss-120b', 'openai/gpt-oss-20b'];
+        }
+        const model = ['openai/gpt-oss-120b', 'openai/gpt-oss-20b'].find(m => ids.includes(m)) || ids[0];
+        return model ? { provider: 'groq', apiKey: keys.groq, model } : null;
+    }
+
     /** Vision-capable models to try, fastest first. */
     async _askModels() {
         const list = [];
@@ -375,13 +410,14 @@ class AskService {
                 const tStart = Date.now();
                 const ttft = setTimeout(() => !started && ctrl.abort(), ASK_FIRST_TOKEN_TIMEOUT_MS);
                 hedgeTimers.push(setTimeout(() => !started && !winner && launch(), ASK_HEDGE_AFTER_MS));
+                if (m.launchWithNext) launch(); // start the picture model at the same time
                 streamAnswer({
                     provider: m.provider,
                     apiKey: m.apiKey,
                     model: m.model,
                     system: ASK_SYSTEM_PROMPT,
-                    user,
-                    imageBase64,
+                    user: m.user || user,
+                    imageBase64: m.noImage ? null : imageBase64,
                     temperature: 0.2,
                     maxTokens: 700,
                     reasoningEffort: 'low',
