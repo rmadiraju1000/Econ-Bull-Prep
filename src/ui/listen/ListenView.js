@@ -161,6 +161,8 @@ export class ListenView extends LitElement {
         }
 
         .top-bar {
+            -webkit-app-region: drag; /* drag here to move the window */
+            cursor: grab;
             display: flex;
             justify-content: space-between;
             align-items: center;
@@ -689,12 +691,15 @@ export class ListenView extends LitElement {
 
         return html`
             <div class="assistant-container">
-                <div class="top-bar">
-                    <div class="tabs">
+                <div class="top-bar" title="Drag here to move · drag the edges to resize">
+                    <div class="tabs" style="-webkit-app-region: no-drag">
                         ${tab('answers', 'Answers')} ${tab('meeting', 'Meeting')} ${tab('transcript', 'Transcript')}
                     </div>
-                    <div class="bar-right">
+                    <div class="bar-right" style="-webkit-app-region: no-drag">
                         ${this.isSessionActive ? html`<span class="timer">${this.elapsedTime}</span>` : ''}
+                        <button class="copy-button" title="Snap back under the header (undo your move/resize)" @click=${() => window.api?.common?.resetWindowPlacement?.('listen')}>
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 14h6v6M20 10h-6V4M14 10l7-7M3 21l7-7"/></svg>
+                        </button>
                         <button
                             class="copy-button ${this.copyState === 'copied' ? 'copied' : ''}"
                             @click=${this.handleCopy}

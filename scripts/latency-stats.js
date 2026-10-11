@@ -99,7 +99,7 @@ for (const l of lines) {
         const wasSkipped = skipNextAnswer;
         skipNextAnswer = false;
         if (wasSkipped) leadEvents = leadEvents.filter(e => e.seq !== m[1]);
-        else if (m[2] === 'NONE') c.none++;
+        else if (m[2] === 'NONE' || m[2] === 'SKIP') c.none++;
         else if (m[2] === 'SAME' || (!m[2] && /Q: SAME/.test(l))) c.same++;
         else {
             c.answered++;

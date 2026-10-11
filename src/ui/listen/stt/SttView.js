@@ -16,7 +16,7 @@ export class SttView extends LitElement {
             flex-direction: column;
             gap: 8px;
             min-height: 150px;
-            max-height: 600px;
+            max-height: var(--glass-content-max, 600px);
             position: relative;
             z-index: 1;
             flex: 1;

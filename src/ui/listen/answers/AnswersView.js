@@ -14,7 +14,7 @@ export class AnswersView extends LitElement {
         .answers-container {
             overflow-y: auto;
             padding: 10px 14px 14px 14px;
-            max-height: 620px;
+            max-height: var(--glass-content-max, 620px);
             font-family: 'Helvetica Neue', sans-serif;
         }
 
@@ -108,7 +108,8 @@ export class AnswersView extends LitElement {
 
         .toolbar {
             display: flex;
-            gap: 14px;
+            gap: 6px 14px;
+            flex-wrap: wrap;
             align-items: center;
             margin: 0 2px 10px 2px;
             color: rgba(255, 255, 255, 0.8);
@@ -226,9 +227,9 @@ export class AnswersView extends LitElement {
 
     _loadOptions() {
         try {
-            return { verify: false, ignoreMic: false, ...JSON.parse(localStorage.getItem('qaOptions') || '{}') };
+            return { verify: false, ignoreMic: false, factualOnly: true, ...JSON.parse(localStorage.getItem('qaOptions') || '{}') };
         } catch (_) {
-            return { verify: false, ignoreMic: false };
+            return { verify: false, ignoreMic: false, factualOnly: true };
         }
     }
 
@@ -333,6 +334,10 @@ export class AnswersView extends LitElement {
                     <label title="After a fast answer, check it with the smarter model and fix it if needed (uses an extra request).">
                         <input type="checkbox" .checked=${!!this.options.verify} @change=${e => this._setOption('verify', e.target.checked)} />
                         Double-check answers
+                    </label>
+                    <label title="Group calls: only answer questions with a real right answer (facts, data, definitions, math). Skips opinions, plans and small talk like 'who wants to present?'. If unsure, it still answers.">
+                        <input type="checkbox" .checked=${!!this.options.factualOnly} @change=${e => this._setOption('factualOnly', e.target.checked)} />
+                        Factual questions only
                     </label>
                     <label title="Ignore your microphone; only answer questions from the call / computer audio.">
                         <input type="checkbox" .checked=${!!this.options.ignoreMic} @change=${e => this._setOption('ignoreMic', e.target.checked)} />

@@ -82,7 +82,7 @@ export class SummaryView extends LitElement {
             position: relative;
             z-index: 1;
             min-height: 150px;
-            max-height: 600px;
+            max-height: var(--glass-content-max, 600px);
             flex: 1;
         }
 

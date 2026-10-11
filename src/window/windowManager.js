@@ -42,6 +42,71 @@ let settingsHideTimer = null;
 let layoutManager = null;
 let movementManager = null;
 
+// ── Windows you move or resize yourself stay where you put them ──────────────
+// { listen: { bounds, sized }, ask: { bounds, sized } } — saved between launches.
+const fs = require('node:fs');
+const PLACEMENT_FILE = () => path.join(app.getPath('userData'), 'window-placement.json');
+let userPlaced = {};
+try {
+    userPlaced = JSON.parse(fs.readFileSync(PLACEMENT_FILE(), 'utf8')) || {};
+} catch (_) {
+    userPlaced = {};
+}
+let savePlacementTimer = null;
+function savePlacement() {
+    clearTimeout(savePlacementTimer);
+    savePlacementTimer = setTimeout(() => {
+        try {
+            fs.writeFileSync(PLACEMENT_FILE(), JSON.stringify(userPlaced));
+        } catch (e) {
+            console.warn('[WindowManager] Could not save window placement:', e.message);
+        }
+    }, 300);
+}
+function sendUserSized(name) {
+    const win = windowPool.get(name);
+    if (win && !win.isDestroyed()) win.webContents.send('window:user-sized', !!userPlaced[name]?.sized);
+}
+/** Keep a saved position on a screen that still exists (monitor unplugged, resolution changed). */
+function clampToScreen(bounds) {
+    const display = screen.getDisplayMatching(bounds);
+    const wa = display.workArea;
+    const width = Math.min(bounds.width, wa.width);
+    const height = Math.min(bounds.height, wa.height);
+    const x = Math.max(wa.x, Math.min(bounds.x, wa.x + wa.width - width));
+    const y = Math.max(wa.y, Math.min(bounds.y, wa.y + wa.height - height));
+    return { x: Math.round(x), y: Math.round(y), width: Math.round(width), height: Math.round(height) };
+}
+function trackUserPlacement(name, win) {
+    let userAction = null;
+    win.on('will-move', () => {
+        if (!movementManager?.isAnimating) userAction = userAction || 'move';
+    });
+    win.on('will-resize', () => {
+        userAction = 'resize';
+    });
+    const commit = () => {
+        if (!userAction) return;
+        const sized = userAction === 'resize' || !!userPlaced[name]?.sized;
+        userAction = null;
+        userPlaced[name] = { bounds: win.getBounds(), sized };
+        console.log(`[WindowManager] You placed '${name}' at ${JSON.stringify(userPlaced[name].bounds)}${sized ? ' (custom size)' : ''}`);
+        savePlacement();
+        sendUserSized(name);
+    };
+    win.on('moved', commit);
+    win.on('resized', commit);
+    win.webContents.on('did-finish-load', () => sendUserSized(name));
+}
+const resetWindowPlacement = (name) => {
+    if (!userPlaced[name]) return;
+    delete userPlaced[name];
+    savePlacement();
+    sendUserSized(name);
+    console.log(`[WindowManager] '${name}' snapped back next to the header`);
+    updateChildWindowLayouts(true);
+};
+
 
 function updateChildWindowLayouts(animated = true) {
     // if (movementManager.isAnimating) return;
@@ -49,10 +114,10 @@ function updateChildWindowLayouts(animated = true) {
     const visibleWindows = {};
     const listenWin = windowPool.get('listen');
     const askWin = windowPool.get('ask');
-    if (listenWin && !listenWin.isDestroyed() && listenWin.isVisible()) {
+    if (listenWin && !listenWin.isDestroyed() && listenWin.isVisible() && !userPlaced.listen) {
         visibleWindows.listen = true;
     }
-    if (askWin && !askWin.isDestroyed() && askWin.isVisible()) {
+    if (askWin && !askWin.isDestroyed() && askWin.isVisible() && !userPlaced.ask) {
         visibleWindows.ask = true;
     }
 
@@ -142,10 +207,10 @@ function setupWindowController(windowPool, layoutManager, movementManager) {
             const visibleWindows = {};
             const listenWin = windowPool.get('listen');
             const askWin = windowPool.get('ask');
-            if (listenWin && !listenWin.isDestroyed() && listenWin.isVisible()) {
+            if (listenWin && !listenWin.isDestroyed() && listenWin.isVisible() && !userPlaced.listen) {
                 visibleWindows.listen = true;
             }
-            if (askWin && !askWin.isDestroyed() && askWin.isVisible()) {
+            if (askWin && !askWin.isDestroyed() && askWin.isVisible() && !userPlaced.ask) {
                 visibleWindows.ask = true;
             }
 
@@ -198,20 +263,19 @@ function setupWindowController(windowPool, layoutManager, movementManager) {
         }
     });
     internalBridge.on('window:adjustWindowHeight', ({ winName, targetHeight }) => {
-        console.log(`[Layout Debug] adjustWindowHeight: targetHeight=${targetHeight}`);
         const senderWindow = windowPool.get(winName);
-        if (senderWindow) {
-            const newBounds = layoutManager.calculateWindowHeightAdjustment(senderWindow, targetHeight);
-            
-            const wasResizable = senderWindow.isResizable();
-            if (!wasResizable) senderWindow.setResizable(true);
-
-            movementManager.animateWindowBounds(senderWindow, newBounds, {
-                onComplete: () => {
-                    if (!wasResizable) senderWindow.setResizable(false);
-                    updateChildWindowLayouts(true);
-                }
-            });
+        if (!senderWindow || senderWindow.isDestroyed()) return;
+        if (userPlaced[winName]?.sized) return; // you picked the size; the content scrolls inside it
+        const current = senderWindow.getBounds();
+        const newBounds = layoutManager.calculateWindowHeightAdjustment(senderWindow, targetHeight);
+        if (!newBounds || Math.abs(newBounds.height - current.height) < 4) return; // nothing to do (was firing thousands of times)
+        // Grow/shrink instantly instead of animating, so it never fights a drag.
+        senderWindow.setBounds(userPlaced[winName] ? clampToScreen(newBounds) : newBounds);
+        if (userPlaced[winName]) {
+            userPlaced[winName].bounds = senderWindow.getBounds();
+            savePlacement();
+        } else {
+            updateChildWindowLayouts(false);
         }
     });
 }
@@ -369,7 +433,21 @@ async function handleWindowVisibilityRequest(windowPool, layoutManager, movement
             finalVisibility[name] = false;
         }
 
+        // Windows you placed yourself are not part of the automatic layout.
+        if (userPlaced.listen) finalVisibility.listen = false;
+        if (userPlaced.ask) finalVisibility.ask = false;
         const targetLayout = layoutManager.calculateFeatureWindowLayout(finalVisibility);
+
+        if (shouldBeVisible && userPlaced[name]) {
+            if (!win) return;
+            win.setOpacity(0);
+            win.setBounds(clampToScreen(userPlaced[name].bounds));
+            win.show();
+            movementManager.fade(win, { to: 1 });
+            movementManager.animateLayout(targetLayout);
+            sendUserSized(name);
+            return;
+        }
 
         if (shouldBeVisible) {
             if (!win) return;
@@ -396,7 +474,7 @@ async function handleWindowVisibilityRequest(windowPool, layoutManager, movement
             else if (name === 'ask') targetPos.y -= ANIM_OFFSET_Y;
 
             movementManager.fade(win, { to: 0, onComplete: () => win.hide() });
-            movementManager.animateWindowPosition(win, targetPos);
+            if (!userPlaced[name]) movementManager.animateWindowPosition(win, targetPos);
             
             // 다른 창들도 새 레이아웃으로 애니메이션
             const otherWindowsLayout = { ...targetLayout };
@@ -439,6 +517,8 @@ function createFeatureWindows(header, namesToCreate) {
 
     const commonChildOptions = {
         parent: header,
+        maximizable: false, // double-clicking the drag bar shouldn't blow the window up to full screen
+        fullscreenable: false,
         show: false,
         frame: false,
         transparent: true,
@@ -460,9 +540,10 @@ function createFeatureWindows(header, namesToCreate) {
         switch (name) {
             case 'listen': {
                 const listen = new BrowserWindow({
-                    ...commonChildOptions, width:400,minWidth:400,maxWidth:900,
-                    maxHeight:900,
+                    ...commonChildOptions, width:400, minWidth:300, maxWidth:1200,
+                    minHeight:120, maxHeight:1400, resizable:true,
                 });
+                trackUserPlacement('listen', listen);
                 listen.setContentProtection(isContentProtectionOn);
                 listen.setVisibleOnAllWorkspaces(true,{visibleOnFullScreen:true});
                 if (process.platform === 'darwin') {
@@ -493,7 +574,8 @@ function createFeatureWindows(header, namesToCreate) {
 
             // ask
             case 'ask': {
-                const ask = new BrowserWindow({ ...commonChildOptions, width:600 });
+                const ask = new BrowserWindow({ ...commonChildOptions, width:600, minWidth:320, minHeight:80, maxHeight:1400, resizable:true });
+                trackUserPlacement('ask', ask);
                 ask.setContentProtection(isContentProtectionOn);
                 ask.setVisibleOnAllWorkspaces(true,{visibleOnFullScreen:true});
                 if (process.platform === 'darwin') {
@@ -703,6 +785,14 @@ function createWindows() {
 
 
     header.on('moved', () => {
+        // Windows you placed move along with the header; remember where they are now.
+        for (const name of ['listen', 'ask']) {
+            const w = windowPool.get(name);
+            if (userPlaced[name] && w && !w.isDestroyed() && w.isVisible()) {
+                userPlaced[name].bounds = w.getBounds();
+                savePlacement();
+            }
+        }
         if (movementManager.isAnimating) {
             return;
         }
@@ -808,4 +898,5 @@ module.exports = {
     getHeaderPosition,
     moveHeaderTo,
     adjustWindowHeight,
+    resetWindowPlacement,
 };

@@ -53,6 +53,16 @@ const SYSTEM_PROMPT = [
     'Economics: use correct terms, get the DIRECTION of every effect right (which curve shifts, left or right; who bears a tax: the more inelastic side), and do any arithmetic step by step before answering. Keep the visible answer under 80 words.',
 ].join('\n');
 
+// Group calls: only questions with a checkable right answer. Same request, so no extra delay.
+const FACTUAL_ONLY_RULE = [
+    'FACTUAL-ONLY MODE (group call): answer only questions that have an objectively correct answer from facts, data, definitions, calculations, rules, or material being shown/read (quiz, test, homework, knowledge or "what does X mean" questions).',
+    'Reply exactly "Q: SKIP" for opinions, preferences, plans and logistics, or social chat: e.g. "what do you think?", "who wants to present?", "can everyone hear me?", "should we take a break?", "how was your weekend?", "what should we do today?", questions about the people on the call.',
+    'If you are unsure whether it has a factual answer, ANSWER it (never skip a real question).',
+].join('\n');
+// Obvious call logistics/small talk: skipped before any request (only when the whole question matches).
+const LOGISTICS_RE =
+    /^\W*(?:okay|ok|so|alright|all right|um|uh|and|now)?[\s,]*(?:can|could) (?:you|everyone|everybody|y'all|you all|people) (?:hear|see) (?:me|my|us|this|that|the)\b|^\W*(?:okay|ok|so|alright|all right)?[\s,]*(?:who(?:'s| is| wants| would like)?|anyone|anybody|does anyone|does anybody) (?:want to |wants to |like to )?(?:go(?:ing)? (?:first|next)|ready|next|share|present|volunteer|have (?:any )?questions)\b|^\W*(?:any|other|more) questions\W*$|^\W*(?:does (?:that|this) make sense|are (?:we|you|y'all) (?:good|ready|there)|is everyone (?:here|ready|good)|how (?:are|is) (?:you|everyone|everybody|it going)|how was (?:your|the) (?:weekend|day|break)|should we (?:take a break|get started|start|wrap up|move on))\b/i;
+
 const VERIFY_PROMPT = [
     'You are checking a quick answer to a question asked during a live economics quiz or call.',
     'Work it out yourself carefully (directions of shifts, who bears a tax, arithmetic).',
@@ -171,7 +181,7 @@ function similarity(a, b) {
 class LiveQA {
     constructor(sendToRenderer) {
         this.send = sendToRenderer;
-        this.options = { verify: false, ignoreMic: false };
+        this.options = { verify: false, ignoreMic: false, factualOnly: true };
         this.deadModels = new Set();
         this.reset({ silent: true });
     }
@@ -197,9 +207,20 @@ class LiveQA {
         if (!silent) this.publish();
     }
 
+    systemPrompt() {
+        return this.options.factualOnly ? `${SYSTEM_PROMPT}\n${FACTUAL_ONLY_RULE}` : SYSTEM_PROMPT;
+    }
+
+    /** Factual-only mode: obvious "can you hear me / who's next / any questions" lines never cost a request. */
+    isLogistics(question) {
+        const q = (question || '').trim();
+        // Short lines only, so "Can you see the curve shift here — what happens to price?" is still answered.
+        return !!this.options.factualOnly && wordCount(q) <= 9 && !/\d/.test(q) && LOGISTICS_RE.test(q);
+    }
+
     setOptions(opts = {}) {
         this.options = { ...this.options, ...opts };
-        console.log(`[LiveQA] Options: double-check=${this.options.verify ? 'on' : 'off'}, call audio only=${this.options.ignoreMic ? 'on' : 'off'}`);
+        console.log(`[LiveQA] Options: double-check=${this.options.verify ? 'on' : 'off'}, call audio only=${this.options.ignoreMic ? 'on' : 'off'}, factual questions only=${this.options.factualOnly ? 'on' : 'off'}`);
         this.publish();
     }
 
@@ -293,6 +314,7 @@ class LiveQA {
         // 1) A question has been fully spoken (ends in "?", fill-in, or timer cue
         //    after it) — answer right away, even if the speaker keeps talking.
         const cq = completedQuestion(text);
+        if (cq && this.isLogistics(cq.question)) return; // "Can everyone hear me?" etc.
         if (cq) {
             if (st.fired.some(k => sameQuestion(k, cq.question))) return; // already answering this one
             // Same question already queued: don't restart the short wait on every partial.
@@ -356,6 +378,11 @@ class LiveQA {
 
         // The last complete question in this turn was already answered early: confirm it.
         const lastQ = completedQuestion(text);
+        const lastSentence = lastQ ? lastQ.question : ((text.match(/[^.?!]+[.?!]*\s*$/) || [text])[0]);
+        if (this.isLogistics(lastSentence)) {
+            console.log(`[LiveQA] Skipping call logistics: "${lastWords(lastSentence, 12)}"`);
+            return;
+        }
         if (lastQ && fired.some(k => sameQuestion(k, lastQ.question))) {
             console.log('[LiveQA] Final turn matches early answer, keeping it');
             this.markTiming(earlySeq, 'endAt');
@@ -605,7 +632,7 @@ class LiveQA {
                     apiKey: smartInfo.apiKey,
                     model: smartInfo.model,
                     reasoningEffort: 'medium',
-                    system: SYSTEM_PROMPT,
+                    system: this.systemPrompt(),
                     user,
                     temperature: 0.2,
                     maxTokens: 1500,
@@ -636,7 +663,7 @@ class LiveQA {
                     apiKey: m.apiKey,
                     model: m.model,
                     reasoningEffort: m.effort,
-                    system: SYSTEM_PROMPT,
+                    system: this.systemPrompt(),
                     user,
                     temperature: 0.2,
                     maxTokens: m.effort === 'medium' ? 1500 : 700, // includes hidden reasoning tokens
@@ -658,7 +685,7 @@ class LiveQA {
                 if (!full.trim()) throw new Error('Empty response');
                 render(full, true);
                 const p = this.parse(full, true);
-                const tag = p.same ? 'SAME' : p.none ? 'NONE' : p.question;
+                const tag = p.same ? 'SAME' : p.skip ? 'SKIP' : p.none ? 'NONE' : p.question;
                 console.log(`📝 [LiveQA] (#${seq}) Q: ${tag} | A: ${p.answer} | ${p.points.join(' / ')}`);
                 if (outcome === 'answered' || p.same) (this.answeredSeqs = this.answeredSeqs || new Set()).add(seq);
                 console.log(`⚡ [LiveQA] Done in ${Date.now() - startedAt}ms (attempt took ${Date.now() - t0}ms)`);
@@ -708,7 +735,7 @@ class LiveQA {
             const smartAnswered = p && !p.none && !p.same && p.answer;
             if (r.error) console.error(`❌ [LiveQA] ${smartInfo.model} review error: ${(r.error.message || r.error).toString().slice(0, 160)}`);
             if (p) {
-                const tag = p.same ? 'SAME' : p.none ? 'NONE' : p.answer;
+                const tag = p.same ? 'SAME' : p.skip ? 'SKIP' : p.none ? 'NONE' : p.answer;
                 console.log(`🔍 [LiveQA] 120B review (#${seq}) in ${r.ms}ms: ${tag}`);
             }
             if (outcome === 'answered' && card) {
@@ -812,7 +839,10 @@ class LiveQA {
             if (q) {
                 if (!qLineDone) continue;
                 const v = q[1].trim();
-                if (/^none\b/i.test(v)) out.none = true;
+                if (/^(none|skip)\b/i.test(v)) {
+                    out.none = true;
+                    if (/^skip\b/i.test(v)) out.skip = true;
+                }
                 else if (/^same\b/i.test(v)) out.same = true;
                 else out.question = v;
             } else if (a) {

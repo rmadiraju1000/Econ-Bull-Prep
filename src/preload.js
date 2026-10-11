@@ -1,6 +1,22 @@
 // src/preload.js
 const { contextBridge, ipcRenderer } = require('electron');
 
+// When you resize the Answers/Ask window yourself, let its content fill that size and scroll.
+ipcRenderer.on('window:user-sized', (_event, sized) => {
+  const apply = () => {
+    const root = document.documentElement.style;
+    if (sized) {
+      root.setProperty('--glass-content-max', 'calc(100vh - 48px)');
+      root.setProperty('--glass-ask-max', 'calc(100vh - 110px)');
+    } else {
+      root.removeProperty('--glass-content-max');
+      root.removeProperty('--glass-ask-max');
+    }
+  };
+  if (document.readyState === 'loading') window.addEventListener('DOMContentLoaded', apply, { once: true });
+  else apply();
+});
+
 contextBridge.exposeInMainWorld('api', {
   // Platform information for renderer processes
   platform: {
@@ -17,6 +33,9 @@ contextBridge.exposeInMainWorld('api', {
     startFirebaseAuth: () => ipcRenderer.invoke('start-firebase-auth'),
     firebaseLogout: () => ipcRenderer.invoke('firebase-logout'),
     
+    // Snap a window you moved/resized back next to the header
+    resetWindowPlacement: (name) => ipcRenderer.invoke('window:reset-placement', name),
+
     // App Control
       quitApplication: () => ipcRenderer.invoke('quit-application'),
       openExternal: (url) => ipcRenderer.invoke('open-external', url),

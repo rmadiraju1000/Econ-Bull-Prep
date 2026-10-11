@@ -203,6 +203,7 @@ export class AskView extends LitElement {
         }
 
         .response-header {
+            -webkit-app-region: drag; /* drag here to move the window */
             display: flex;
             justify-content: space-between;
             align-items: center;
@@ -369,7 +370,7 @@ export class AskView extends LitElement {
             line-height: 1.6;
             background: transparent;
             min-height: 0;
-            max-height: 400px;
+            max-height: var(--glass-ask-max, 400px);
             position: relative;
         }
 
@@ -1335,7 +1336,7 @@ export class AskView extends LitElement {
         return html`
             <div class="ask-container">
                 <!-- Response Header -->
-                <div class="response-header ${!hasResponse ? 'hidden' : ''}">
+                <div class="response-header ${!hasResponse ? 'hidden' : ''}" title="Drag here to move · drag the edges to resize">
                     <div class="header-left">
                         <div class="response-icon">
                             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -1347,7 +1348,10 @@ export class AskView extends LitElement {
                     </div>
                     <div class="header-right">
                         <span class="question-text">${this.getTruncatedQuestion(this.currentQuestion)}</span>
-                        <div class="header-controls">
+                        <div class="header-controls" style="-webkit-app-region: no-drag">
+                            <button class="copy-button" title="Snap back under the header (undo your move/resize)" @click=${() => window.api?.common?.resetWindowPlacement?.('ask')}>
+                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 14h6v6M20 10h-6V4M14 10l7-7M3 21l7-7"/></svg>
+                            </button>
                             <button class="copy-button ${this.copyState === 'copied' ? 'copied' : ''}" @click=${this.handleCopy}>
                                 <svg class="copy-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                                     <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
